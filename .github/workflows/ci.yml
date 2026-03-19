@@ -1,0 +1,54 @@
+﻿name: ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ros2_ws/**"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "ros2_ws/**"
+      - ".github/workflows/**"
+
+jobs:
+  ros2-jazzy-ci:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup ROS 2 Jazzy
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+
+      - name: Install workspace dependencies
+        shell: bash
+        run: |
+          set -e
+          rosdep update
+          rosdep install --from-paths ros2_ws/src --ignore-src -r -y
+
+      - name: Build workspace
+        shell: bash
+        run: |
+          set -e
+          source /opt/ros/jazzy/setup.bash
+          colcon build \
+            --base-paths ros2_ws/src \
+            --event-handlers console_direct+
+
+      - name: Test workspace
+        shell: bash
+        run: |
+          set -e
+          source /opt/ros/jazzy/setup.bash
+          colcon test \
+            --base-paths ros2_ws/src \
+            --event-handlers console_direct+
+          colcon test-result --all --verbose
