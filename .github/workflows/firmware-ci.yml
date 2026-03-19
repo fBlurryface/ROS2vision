@@ -1,0 +1,39 @@
+﻿name: firmware-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  arduino-compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: "1.x"
+
+      - name: Update core index
+        run: arduino-cli core update-index
+
+      - name: Install Arduino AVR core
+        run: arduino-cli core install arduino:avr
+
+      - name: Compile Uno firmware
+        run: |
+          arduino-cli compile \
+            --fqbn arduino:avr:uno \
+            firmware/uno_controller
