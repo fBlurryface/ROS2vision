@@ -1,0 +1,15 @@
+﻿<?xml version="1.0"?>
+<package format="3">
+  <name>ros2vision_interfaces</name>
+  <version>0.0.1</version>
+  <description>Custom interfaces for the ROS2vision system.</description>
+
+  <maintainer email="your_email@example.com">ZHU WEIZHE</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+</package>
