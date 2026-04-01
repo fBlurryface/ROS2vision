@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    video_device: "/dev/video0"
+    video_device: "/dev/ros2vision_camera"
     framerate: 20.0
     io_method: "mmap"
     pixel_format: "mjpeg2rgb"

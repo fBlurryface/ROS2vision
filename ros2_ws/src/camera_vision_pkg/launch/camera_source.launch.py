@@ -30,6 +30,9 @@ def launch_setup(context, *args, **kwargs):
         namespace=LaunchConfiguration('namespace'),
         name='camera_source',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+        respawn_max_retries=-1,
         parameters=[
             params_file,
             {
@@ -47,7 +50,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'mode',
-            default_value='hd',
+            default_value='vga',
             description='Camera mode: vga | wide | hd',
         ),
         DeclareLaunchArgument(
@@ -57,8 +60,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'video_device',
-            default_value='/dev/video0',
-            description='Video device path',
+            default_value='/dev/ros2vision_camera',
+            description='Persistent video device path',
         ),
         DeclareLaunchArgument(
             'camera_name',
