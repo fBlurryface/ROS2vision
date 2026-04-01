@@ -24,26 +24,22 @@ def launch_setup(context, *args, **kwargs):
     pkg_share = get_package_share_directory('camera_vision_pkg')
     params_file = os.path.join(pkg_share, 'config', MODE_TO_CONFIG[mode])
 
-    camera_node = Node(
-        package='usb_cam',
-        executable='usb_cam_node_exe',
-        namespace=LaunchConfiguration('namespace'),
-        name='camera_source',
+    runner_node = Node(
+        package='camera_vision_pkg',
+        executable='camera_runner',
+        name='camera_runner',
         output='screen',
-        respawn=True,
-        respawn_delay=2.0,
-        respawn_max_retries=-1,
-        parameters=[
-            params_file,
-            {
-                'video_device': LaunchConfiguration('video_device'),
-                'camera_name': LaunchConfiguration('camera_name'),
-                'frame_id': LaunchConfiguration('frame_id'),
-            },
+        arguments=[
+            '--params-file', params_file,
+            '--video-device', LaunchConfiguration('video_device'),
+            '--camera-name', LaunchConfiguration('camera_name'),
+            '--frame-id', LaunchConfiguration('frame_id'),
+            '--namespace', LaunchConfiguration('namespace'),
+            '--retry-delay', '2.5',
         ],
     )
 
-    return [camera_node]
+    return [runner_node]
 
 
 def generate_launch_description():
