@@ -9,3 +9,8 @@
     camera_name: "front_camera"
     camera_info_url: ""
     frame_id: "camera_optical_frame"
+    brightness: -1
+    contrast: -1
+    saturation: -1
+    sharpness: -1
+    gain: -1
