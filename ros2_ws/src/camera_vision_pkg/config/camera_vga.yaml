@@ -1,0 +1,11 @@
+/**:
+  ros__parameters:
+    video_device: "/dev/video0"
+    framerate: 20.0
+    io_method: "mmap"
+    pixel_format: "mjpeg2rgb"
+    image_width: 640
+    image_height: 480
+    camera_name: "front_camera"
+    camera_info_url: ""
+    frame_id: "camera_optical_frame"
