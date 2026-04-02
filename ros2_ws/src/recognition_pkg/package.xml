@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>recognition_pkg</name>
+  <version>0.0.0</version>
+  <description>Recognition package for ROS2vision image preprocessing and future inference nodes.</description>
+  <maintainer email="fblurryface@example.com">fBlurryface</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>rcl_interfaces</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

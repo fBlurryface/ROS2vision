@@ -1,0 +1,19 @@
+image_preprocessor_node:
+  ros__parameters:
+    input_topic: /camera/image_raw
+    output_topic: /recognition/preprocessed/image
+    debug_topic: /recognition/preprocessed/debug_image
+    mask_topic: /recognition/preprocessed/mask
+
+    mode: face
+
+    output_width: 320
+    output_height: 320
+    keep_aspect_ratio: true
+    publish_debug_image: true
+    publish_mask: false
+
+    face_output_encoding: rgb8
+    face_equalize_hist: false
+    face_gaussian_blur: false
+    face_blur_kernel: 3

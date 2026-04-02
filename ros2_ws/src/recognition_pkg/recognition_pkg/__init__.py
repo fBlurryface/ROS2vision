@@ -1,0 +1,1 @@
+"""recognition_pkg Python package."""

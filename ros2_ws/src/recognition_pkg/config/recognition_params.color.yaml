@@ -1,0 +1,25 @@
+image_preprocessor_node:
+  ros__parameters:
+    input_topic: /camera/image_raw
+    output_topic: /recognition/preprocessed/image
+    debug_topic: /recognition/preprocessed/debug_image
+    mask_topic: /recognition/preprocessed/mask
+
+    mode: color
+
+    output_width: 320
+    output_height: 320
+    keep_aspect_ratio: true
+    publish_debug_image: true
+    publish_mask: true
+
+    color_space: hsv
+    color_lower_h: 0
+    color_lower_s: 120
+    color_lower_v: 70
+    color_upper_h: 10
+    color_upper_s: 255
+    color_upper_v: 255
+    color_morph_open: 3
+    color_morph_close: 5
+    color_apply_mask_to_output: false
