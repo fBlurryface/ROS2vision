@@ -1,4 +1,4 @@
-﻿# ROS2vision
+# ROS2vision
 
 ROS 2 Jazzy visual closed-loop project with an industrial PC camera pipeline and Arduino UNO actuator control.
 
@@ -28,6 +28,7 @@ The repository has completed its initial engineering scaffold:
 - GitHub Actions CI exists for Arduino firmware compilation
 - UNO controller firmware has an initial implementation
 - `camera_vision_pkg` is now a real ROS 2 package and has become the first package with a validated bringup path
+- `recognition_pkg` now has its first validated preprocessing node for future recognition tasks
 
 ## Camera subsystem status
 
@@ -56,6 +57,8 @@ See detailed notes here:
 - `docs/software/camera.md`
 - `docs/deployment/industrial_pc_setup.md`
 - `ros2_ws/src/camera_vision_pkg/README.md`
+- `docs/software/recognition.md`
+- `ros2_ws/src/recognition_pkg/README.md`
 
 ## Recommended reading order
 
