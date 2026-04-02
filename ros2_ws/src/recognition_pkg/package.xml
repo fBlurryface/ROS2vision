@@ -6,8 +6,6 @@
   <maintainer email="fblurryface@example.com">fBlurryface</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
-
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
