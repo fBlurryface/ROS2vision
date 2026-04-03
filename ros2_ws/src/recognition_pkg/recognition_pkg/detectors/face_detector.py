@@ -8,6 +8,8 @@ from recognition_pkg.detectors.base_detector import BaseDetector, DetectionResul
 
 
 class FaceDetector(BaseDetector):
+    DEFAULT_CASCADE_FILENAME = "haarcascade_frontalface_default.xml"
+
     def __init__(
         self,
         cascade_path: str = "",
@@ -15,10 +17,7 @@ class FaceDetector(BaseDetector):
         scale_factor: float = 1.1,
         min_neighbors: int = 5,
     ) -> None:
-        if cascade_path:
-            resolved_path = Path(cascade_path)
-        else:
-            resolved_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        resolved_path = self._resolve_cascade_path(cascade_path)
 
         self.cascade_path = str(resolved_path)
         self.min_size = int(min_size)
@@ -62,4 +61,37 @@ class FaceDetector(BaseDetector):
             bbox_h=int(h),
             area=area,
             score=float(score),
+        )
+
+    @classmethod
+    def _resolve_cascade_path(cls, cascade_path: str) -> Path:
+        candidates: list[Path] = []
+
+        # 1. Explicit override from params
+        if cascade_path:
+            candidates.append(Path(cascade_path).expanduser())
+
+        # 2. OpenCV-provided data path, if available
+        cv2_data = getattr(cv2, "data", None)
+        if cv2_data is not None:
+            haar_dir = getattr(cv2_data, "haarcascades", None)
+            if haar_dir:
+                candidates.append(Path(haar_dir) / cls.DEFAULT_CASCADE_FILENAME)
+
+        # 3. Common Linux install locations
+        candidates.extend([
+            Path("/usr/share/opencv4/haarcascades") / cls.DEFAULT_CASCADE_FILENAME,
+            Path("/usr/share/opencv/haarcascades") / cls.DEFAULT_CASCADE_FILENAME,
+        ])
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+
+        searched = "\n".join(f"  - {str(p)}" for p in candidates) if candidates else "  (no candidates)"
+        raise FileNotFoundError(
+            "Could not locate Haar cascade XML for face detection.\n"
+            "Tried:\n"
+            f"{searched}\n"
+            "You can set 'face_cascade_path' explicitly in the node parameters."
         )
