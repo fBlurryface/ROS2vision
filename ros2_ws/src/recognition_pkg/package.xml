@@ -10,6 +10,7 @@
   <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>rcl_interfaces</depend>
+  <depend>ros2vision_interfaces</depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

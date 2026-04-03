@@ -1,4 +1,4 @@
-﻿<?xml version="1.0"?>
+<?xml version="1.0"?>
 <package format="3">
   <name>ros2vision_interfaces</name>
   <version>0.0.1</version>
@@ -8,6 +8,9 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>std_msgs</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
 

@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "image_preprocessor_node = recognition_pkg.image_preprocessor_node:main",
+            "target_detector_node = recognition_pkg.target_detector_node:main",
         ],
     },
 )

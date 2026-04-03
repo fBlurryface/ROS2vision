@@ -1,0 +1,17 @@
+target_detector_node:
+  ros__parameters:
+    mode: face
+
+    input_image_topic: /recognition/preprocessed/image
+    input_mask_topic: /recognition/preprocessed/mask
+
+    target_topic: /recognition/target
+    debug_image_topic: /recognition/detection/debug_image
+    publish_debug_image: true
+
+    mask_max_age_sec: 0.3
+
+    face_cascade_path: ""
+    face_min_size: 40
+    face_scale_factor: 1.1
+    face_min_neighbors: 5
