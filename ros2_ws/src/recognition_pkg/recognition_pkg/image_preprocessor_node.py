@@ -55,12 +55,18 @@ class ImagePreprocessorNode(Node):
         self.declare_parameter("face_blur_kernel", 3)
 
         self.declare_parameter("color_space", "hsv")
+        self.declare_parameter("color_use_dual_range", True)
+
         self.declare_parameter("color_lower_h", 0)
-        self.declare_parameter("color_lower_s", 120)
-        self.declare_parameter("color_lower_v", 70)
         self.declare_parameter("color_upper_h", 10)
+        self.declare_parameter("color_lower_h_2", 160)
+        self.declare_parameter("color_upper_h_2", 180)
+
+        self.declare_parameter("color_lower_s", 145)
+        self.declare_parameter("color_lower_v", 85)
         self.declare_parameter("color_upper_s", 255)
         self.declare_parameter("color_upper_v", 255)
+
         self.declare_parameter("color_morph_open", 3)
         self.declare_parameter("color_morph_close", 5)
         self.declare_parameter("color_apply_mask_to_output", False)
@@ -107,12 +113,18 @@ class ImagePreprocessorNode(Node):
         self.face_blur_kernel = int(self.get_parameter("face_blur_kernel").value)
 
         self.color_space = self.get_parameter("color_space").value.strip().lower()
+        self.color_use_dual_range = bool(self.get_parameter("color_use_dual_range").value)
+
         self.color_lower_h = int(self.get_parameter("color_lower_h").value)
+        self.color_upper_h = int(self.get_parameter("color_upper_h").value)
+        self.color_lower_h_2 = int(self.get_parameter("color_lower_h_2").value)
+        self.color_upper_h_2 = int(self.get_parameter("color_upper_h_2").value)
+
         self.color_lower_s = int(self.get_parameter("color_lower_s").value)
         self.color_lower_v = int(self.get_parameter("color_lower_v").value)
-        self.color_upper_h = int(self.get_parameter("color_upper_h").value)
         self.color_upper_s = int(self.get_parameter("color_upper_s").value)
         self.color_upper_v = int(self.get_parameter("color_upper_v").value)
+
         self.color_morph_open = int(self.get_parameter("color_morph_open").value)
         self.color_morph_close = int(self.get_parameter("color_morph_close").value)
         self.color_apply_mask_to_output = bool(self.get_parameter("color_apply_mask_to_output").value)
@@ -213,9 +225,15 @@ class ImagePreprocessorNode(Node):
         resized_bgr = self._resize_for_output(frame_bgr)
         hsv = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2HSV)
 
-        lower = np.array([self.color_lower_h, self.color_lower_s, self.color_lower_v], dtype=np.uint8)
-        upper = np.array([self.color_upper_h, self.color_upper_s, self.color_upper_v], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
+        lower_1 = np.array([self.color_lower_h, self.color_lower_s, self.color_lower_v], dtype=np.uint8)
+        upper_1 = np.array([self.color_upper_h, self.color_upper_s, self.color_upper_v], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_1, upper_1)
+
+        if self.color_use_dual_range:
+            lower_2 = np.array([self.color_lower_h_2, self.color_lower_s, self.color_lower_v], dtype=np.uint8)
+            upper_2 = np.array([self.color_upper_h_2, self.color_upper_s, self.color_upper_v], dtype=np.uint8)
+            mask_2 = cv2.inRange(hsv, lower_2, upper_2)
+            mask = cv2.bitwise_or(mask, mask_2)
 
         if self.color_morph_open > 1:
             k_open = self._make_kernel(self.color_morph_open)

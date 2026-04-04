@@ -14,12 +14,18 @@ image_preprocessor_node:
     publish_mask: true
 
     color_space: hsv
+    color_use_dual_range: true
+
     color_lower_h: 0
-    color_lower_s: 120
-    color_lower_v: 70
     color_upper_h: 10
+    color_lower_h_2: 160
+    color_upper_h_2: 180
+
+    color_lower_s: 145
+    color_lower_v: 85
     color_upper_s: 255
     color_upper_v: 255
+
     color_morph_open: 3
     color_morph_close: 5
     color_apply_mask_to_output: false

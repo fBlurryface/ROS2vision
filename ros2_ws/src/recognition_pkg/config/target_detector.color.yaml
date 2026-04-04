@@ -12,14 +12,14 @@ target_detector_node:
     mask_max_age_sec: 0.3
 
     color_use_mask_topic: true
-    color_fallback_to_hsv: true
-    color_min_area: 300.0
+    color_fallback_to_hsv: false
+    color_min_area: 800.0
 
     color_lower_h_1: 0
     color_upper_h_1: 10
-    color_lower_h_2: 170
+    color_lower_h_2: 160
     color_upper_h_2: 180
-    color_lower_s: 120
-    color_lower_v: 70
+    color_lower_s: 145
+    color_lower_v: 85
     color_upper_s: 255
     color_upper_v: 255
