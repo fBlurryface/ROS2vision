@@ -1,0 +1,49 @@
+target_follower_node:
+  ros__parameters:
+    target_topic: /recognition/target
+    angle_command_topic: /control/angle_command
+
+    min_target_score: 0.0
+    min_target_area: 0.0
+
+    smoothing_alpha: 0.35
+    deadband_x: 0.08
+    resume_threshold_x: 0.12
+    reset_filter_on_lost: true
+    target_timeout_sec: 0.5
+    command_cooldown_sec: 0.25
+
+    mapping_mode: stepwise
+    angle_gain: 10.0
+
+    small_error_threshold: 0.15
+    medium_error_threshold: 0.30
+    large_error_threshold: 0.50
+
+    min_angle_deg: 1.0
+    medium_angle_deg: 2.0
+    large_angle_deg: 4.0
+    max_angle_deg: 6.0
+
+    invert_direction: false
+    publish_debug_logs: true
+
+uno_serial_bridge_node:
+  ros__parameters:
+    angle_command_topic: /control/angle_command
+
+    serial_port: /dev/ttyACM0
+    baud_rate: 115200
+    serial_timeout_sec: 0.02
+    min_send_interval_sec: 0.05
+
+    command_mode: angle
+    steps_per_revolution: 4096.0
+    min_effective_step: 1
+
+    drop_commands_while_busy: true
+    busy_hold_sec: 0.20
+    use_done_feedback: true
+
+    log_serial_tx: true
+    log_serial_rx: true

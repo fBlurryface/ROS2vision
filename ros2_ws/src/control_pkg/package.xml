@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>control_pkg</name>
+  <version>0.0.1</version>
+  <description>Control package for ROS2vision target following and UNO serial bridging.</description>
+
+  <maintainer email="your_email@example.com">ZHU WEIZHE</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>ros2vision_interfaces</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
