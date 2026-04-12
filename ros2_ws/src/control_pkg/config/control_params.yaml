@@ -11,7 +11,7 @@ target_follower_node:
     resume_threshold_x: 0.12
     reset_filter_on_lost: true
     target_timeout_sec: 0.5
-    command_cooldown_sec: 0.25
+    command_cooldown_sec: 0.08
 
     mapping_mode: stepwise
     angle_gain: 10.0
@@ -49,7 +49,7 @@ uno_serial_bridge_node:
     min_effective_step: 1
 
     drop_commands_while_busy: true
-    busy_hold_sec: 0.20
+    busy_hold_sec: 0.05
     use_done_feedback: true
 
     enable_raw_command_topic: true
