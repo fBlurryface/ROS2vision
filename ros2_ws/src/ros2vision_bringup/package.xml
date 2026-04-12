@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ros2vision_bringup</name>
+  <version>0.0.1</version>
+  <description>System-level bringup package for ROS2vision.</description>
+
+  <maintainer email="your_email@example.com">ZHU WEIZHE</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>camera_vision_pkg</exec_depend>
+  <exec_depend>recognition_pkg</exec_depend>
+  <exec_depend>control_pkg</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
