@@ -9,6 +9,7 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image
 
 
@@ -39,11 +40,17 @@ class TrackingDebugViewerNode(Node):
         self._last_frame_time_ns: Optional[int] = None
         self._display_fps: Optional[float] = None
 
+        image_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        )
+
         self._subscription = self.create_subscription(
             Image,
             self.input_topic,
             self._image_callback,
-            10,
+            image_qos,
         )
 
         self.get_logger().info(
