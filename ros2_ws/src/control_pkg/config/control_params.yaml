@@ -32,10 +32,17 @@ uno_serial_bridge_node:
   ros__parameters:
     angle_command_topic: /control/angle_command
 
-    serial_port: /dev/ttyACM0
+    serial_port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
     baud_rate: 115200
-    serial_timeout_sec: 0.02
+    serial_timeout_sec: 0.05
     min_send_interval_sec: 0.05
+    reconnect_interval_sec: 1.0
+    startup_reset_wait_sec: 2.0
+
+    require_handshake: true
+    handshake_command: PING
+    handshake_expect: "OK PONG"
+    handshake_timeout_sec: 3.0
 
     command_mode: angle
     steps_per_revolution: 4096.0
@@ -44,6 +51,9 @@ uno_serial_bridge_node:
     drop_commands_while_busy: true
     busy_hold_sec: 0.20
     use_done_feedback: true
+
+    enable_raw_command_topic: true
+    raw_command_topic: /control/raw_serial_command
 
     log_serial_tx: true
     log_serial_rx: true
