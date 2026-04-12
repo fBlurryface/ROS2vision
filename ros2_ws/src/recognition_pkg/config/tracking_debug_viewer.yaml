@@ -1,0 +1,15 @@
+tracking_debug_viewer_node:
+  ros__parameters:
+    input_topic: /recognition/detection/debug_image
+    window_name: ROS2vision Tracking Debug
+    window_width: 1280
+    window_height: 720
+    show_window: true
+    start_fullscreen: false
+    display_fps_overlay: true
+
+    record_enabled: false
+    recording_dir: ~/ros2vision_debug_recordings
+    recording_prefix: tracking_debug
+    recording_fps: 20.0
+    recording_codec: MJPG
