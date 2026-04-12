@@ -25,7 +25,7 @@ target_follower_node:
     large_angle_deg: 4.0
     max_angle_deg: 6.0
 
-    invert_direction: false
+    invert_direction: true
     publish_debug_logs: true
 
 uno_serial_bridge_node:
