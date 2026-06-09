@@ -74,6 +74,25 @@ struct JointMotionOptions {
     uint16_t min_effective_step_us = 0;
 };
 
+
+struct ArmJointGroupTarget {
+    float base_deg;
+    float shoulder_deg;
+    float elbow_deg;
+    float wrist_pitch_deg;
+    float wrist_roll_deg;
+    float claw_gap_cm;
+};
+
+struct ArmJointGroupMotionOptions {
+    JointMotionOptions base;
+    JointMotionOptions shoulder;
+    JointMotionOptions elbow;
+    JointMotionOptions wrist_pitch;
+    JointMotionOptions wrist_roll;
+    JointMotionOptions claw;
+};
+
 struct JointRuntimeState {
     bool configured;
     bool enabled;
@@ -152,6 +171,13 @@ public:
         float target_deg
     );
 
+    // V5A: 中层只做单关节抽象和单位转换。
+    // 该接口按关节写入原始 pulse_us，不做插补。
+    esp_err_t write_us_now(
+        ArmJoint joint,
+        uint16_t pulse_us
+    );
+
     // 按夹爪目标爪距控制，单位 cm。
     // 内部使用夹爪爪距标定表进行分段线性插值。
     esp_err_t move_claw_gap_cm(
@@ -162,6 +188,13 @@ public:
     esp_err_t move_claw_gap_cm(
         float target_gap_cm,
         const JointMotionOptions& options
+    );
+
+    // 多关节同步提交。
+    // 这是独立 group 链路，不循环调用 move_deg() / move_claw_gap_cm()。
+    esp_err_t move_group(
+        const ArmJointGroupTarget& target,
+        const ArmJointGroupMotionOptions& options
     );
 
     uint16_t claw_gap_cm_to_us(float gap_cm) const;
@@ -231,13 +264,6 @@ private:
 
     uint16_t deg_to_us_by_index(uint8_t index, float deg) const;
     float us_to_deg_by_index(uint8_t index, uint16_t pulse_us) const;
-
-    esp_err_t make_servo_motion_options(
-        uint8_t index,
-        float target_deg,
-        const JointMotionOptions& joint_options,
-        ServoMotionOptions* servo_options
-    ) const;
 
     uint16_t claw_gap_cm_to_us_from_table(float gap_cm) const;
     float claw_us_to_gap_cm_from_table(uint16_t pulse_us) const;

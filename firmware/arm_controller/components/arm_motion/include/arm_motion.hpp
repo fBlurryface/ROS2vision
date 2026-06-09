@@ -3,6 +3,9 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "arm_joint.hpp"
 
 namespace learm {
@@ -21,7 +24,6 @@ struct ArmMotionTarget {
     float wrist_roll_deg;
 
     // 夹爪使用真实控制目标：爪距，单位 cm。
-    // 内部调用 arm_joint 的 move_claw_gap_cm()，使用夹爪标定表插值。
     float claw_gap_cm;
 };
 
@@ -58,7 +60,6 @@ struct ArmMotionState {
     JointRuntimeState wrist_roll;
     JointRuntimeState claw;
 
-    // 夹爪最重要的状态是爪距，而不是抽象角度。
     float claw_gap_cm;
     float claw_target_gap_cm;
 };
@@ -69,14 +70,9 @@ public:
 
     bool is_initialized() const;
 
-    // 批量使能全部关节/舵机。
-    // 这是初始化附着操作，不是平滑运动。
-    // 每个关节会使用 arm_joint 层的默认 enable_joint(joint)，
-    // 即附着到各自标定的零位/默认位。
     esp_err_t enable_all();
+    esp_err_t disable_all();
 
-    // 配置类函数：只更新内部配置，不触发运动。
-    // 修改后的配置只影响下一次 move_to()。
     esp_err_t set_durations_ms(
         uint32_t base_ms,
         uint32_t shoulder_ms,
@@ -86,8 +82,6 @@ public:
         uint32_t claw_ms
     );
 
-    // 配置类函数：只更新内部配置，不触发运动。
-    // 修改后的配置只影响下一次 move_to()。
     esp_err_t set_strategies(
         JointMotionStyle base,
         JointMotionStyle shoulder,
@@ -100,8 +94,6 @@ public:
     ArmMotionDurationsMs get_durations_ms() const;
     ArmMotionStrategies get_strategies() const;
 
-    // 运动类函数：读取当前 durations + strategies，
-    // 一次性提交 6 个关节目标并触发运动。
     esp_err_t move_to(
         float base_deg,
         float shoulder_deg,
@@ -121,6 +113,41 @@ public:
     ArmMotionState get_state() const;
 
 private:
+    struct MotionJointState {
+        bool configured = false;
+        bool enabled = false;
+        bool running = false;
+
+        ArmJoint joint = ArmJoint::Claw;
+        ServoChannel channel = ServoChannel::S0;
+
+        uint16_t start_us = 1500;
+        uint16_t current_us = 1500;
+        uint16_t target_us = 1500;
+        uint16_t output_us = 1500;
+
+        uint32_t duration_ms = 0;
+        uint32_t total_steps = 0;
+        uint32_t elapsed_steps = 0;
+
+        MotionProfile profile = MotionProfile::SmootherStep;
+        uint16_t max_step_us = 0;
+        uint16_t min_effective_step_us = 0;
+    };
+
+private:
+    class LockGuard {
+    public:
+        explicit LockGuard(const ArmMotion* owner, TickType_t timeout_ticks = portMAX_DELAY);
+        ~LockGuard();
+
+        bool locked() const;
+
+    private:
+        const ArmMotion* owner_ = nullptr;
+        bool locked_ = false;
+    };
+
     static JointMotionOptions make_options(
         uint32_t duration_ms,
         JointMotionStyle style
@@ -128,22 +155,41 @@ private:
 
     static MotionProfile style_to_profile(JointMotionStyle style);
 
-    esp_err_t move_one_deg(
+    static float evaluate_profile(MotionProfile profile, float t);
+    static float smoothstep(float t);
+    static float smootherstep(float t);
+
+    static int joint_to_index(ArmJoint joint);
+    static uint32_t clamp_duration_ms(uint32_t duration_ms);
+
+    bool take_lock(TickType_t timeout_ticks = portMAX_DELAY) const;
+    void give_lock() const;
+
+    static void task_entry(void* arg);
+    void task_loop();
+
+    void update_all_locked();
+    esp_err_t update_one_locked(uint8_t index);
+
+    esp_err_t sync_state_from_hardware_locked(ArmJoint joint);
+
+    esp_err_t commit_joint_target_locked(
         ArmJoint joint,
-        float target_deg,
-        uint32_t duration_ms,
-        JointMotionStyle style
+        uint16_t target_us,
+        const JointMotionOptions& options
     );
 
-    esp_err_t move_claw_gap(
-        float target_gap_cm,
-        uint32_t duration_ms,
-        JointMotionStyle style
-    );
+    JointRuntimeState make_runtime_state_locked(ArmJoint joint) const;
 
 private:
     bool initialized_ = false;
     ArmJointController* joints_ = nullptr;
+
+    TaskHandle_t task_handle_ = nullptr;
+    volatile bool task_stop_requested_ = false;
+    SemaphoreHandle_t lock_ = nullptr;
+
+    MotionJointState states_[kArmJointCount] = {};
 
     ArmMotionDurationsMs durations_ms_ = {
         700,

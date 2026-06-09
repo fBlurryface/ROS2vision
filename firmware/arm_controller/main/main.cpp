@@ -25,7 +25,7 @@ using learm::JointMotionStyle;
 using learm::JointRuntimeState;
 using learm::ServoPwm;
 
-static const char* TAG = "arm_motion_test";
+static const char* TAG = "arm_motion_v5a";
 
 static ServoPwm g_servo;
 static ArmJointController g_joints;
@@ -162,7 +162,7 @@ static const char* joint_to_name(ArmJoint joint)
 static void print_help()
 {
     printf("\n");
-    printf("========== arm_motion group motion test ==========\n");
+    printf("========== arm_motion V5A motion-owned test ==========\n");
     printf("\n");
     printf("This test uses:\n");
     printf("  g_motion.enable_all()\n");
@@ -482,8 +482,8 @@ static void process_command(char* line)
 
     if (strcmp(line, "disable") == 0 ||
         strcmp(line, "detach") == 0) {
-        ESP_LOGW(TAG, "Disable all joints via arm_joint.disable_all()");
-        const esp_err_t ret = g_joints.disable_all();
+        ESP_LOGW(TAG, "Disable all joints via arm_motion.disable_all()");
+        const esp_err_t ret = g_motion.disable_all();
         printf("disable_all ret=0x%x\n", static_cast<unsigned>(ret));
         print_state();
         return;
@@ -663,7 +663,7 @@ static void process_command(char* line)
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "arm_motion group motion test starting");
+    ESP_LOGI(TAG, "arm_motion V5A motion-owned test starting");
 
     ESP_ERROR_CHECK(
         g_servo.init(
@@ -697,7 +697,7 @@ extern "C" void app_main(void)
 
     char line[160];
 
-    printf("arm_motion_test> ");
+    printf("arm_motion_v5a> ");
     fflush(stdout);
 
     while (true) {
@@ -708,7 +708,7 @@ extern "C" void app_main(void)
 
         process_command(line);
 
-        printf("arm_motion_test> ");
+        printf("arm_motion_v5a> ");
         fflush(stdout);
     }
 }
