@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "arm_joint.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        servo_pwm
+        esp_driver_gpio
+        log
+)

@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "main.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        servo_pwm
+        arm_joint
+        arm_motion
+)
