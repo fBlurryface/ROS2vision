@@ -20,6 +20,7 @@ using learm::ArmMotion;
 using learm::ArmMotionDurationsMs;
 using learm::ArmMotionState;
 using learm::ArmMotionStrategies;
+using learm::ArmMotionSpeedStrategies;
 using learm::JointCalibration;
 using learm::JointMotionStyle;
 using learm::JointRuntimeState;
@@ -169,31 +170,50 @@ static void print_help()
     printf("  g_motion.set_durations_ms(...)\n");
     printf("  g_motion.set_strategies(...)\n");
     printf("  g_motion.move_to(...)\n");
+    printf("  g_motion.move_to_speed(...)\n");
+    printf("  g_motion.move_to_immediate(...)\n");
+    printf("  g_motion.move_delta_immediate(...)\n");
     printf("\n");
     printf("Axis order:\n");
     printf("  base shoulder elbow wrist_pitch wrist_roll claw\n");
     printf("\n");
     printf("Commands:\n");
     printf("  help        print this help\n");
-    printf("  enable      batch enable all joints through arm_motion\n");
-    printf("  disable     disable all joints\n");
+    printf("  enable      initialize/enable all joints at default calibration pose\n");
+    printf("  stop        stop current motion and hold current commanded pose\n");
+    printf("  disable     stop motion and turn PWM output off; torque release is not guaranteed\n");
     printf("  default     print default enable pulse / calibration\n");
     printf("  config      print current durations and strategies\n");
     printf("  state       print arm_motion state\n");
     printf("  ready       print ready / moving state\n");
-    printf("  stop        stop all current motion\n");
     printf("\n");
     printf("  dur B S E WP WR C\n");
     printf("    Set durations in ms. Example:\n");
     printf("    dur 1000 1200 1200 800 600 500\n");
     printf("\n");
     printf("  style B S E WP WR C\n");
-    printf("    Set styles. Use linear/smooth/soft or 0/1/2. Example:\n");
+    printf("    Set duration-line styles. Use linear/smooth/soft or 0/1/2. Example:\n");
     printf("    style smooth soft soft smooth smooth smooth\n");
     printf("\n");
+    printf("  speed B S E WP WR C\n");
+    printf("    Set speed-line max speeds. First 5 are deg/s, last is claw cm/s. Example:\n");
+    printf("    speed 45 35 35 50 70 2.5\n");
+    printf("\n");
     printf("  move B S E WP WR GAP\n");
-    printf("    Move all axes. First 5 are degrees, last is claw gap cm. Example:\n");
+    printf("    Duration-line move. First 5 are degrees, last is claw gap cm. Example:\n");
     printf("    move 0 -30 45 60 0 5.8\n");
+    printf("\n");
+    printf("  movespeed B S E WP WR GAP\n");
+    printf("    Speed-line move using configured max speeds, direct linear speed. Example:\n");
+    printf("    movespeed 0 -30 45 60 0 5.8\n");
+    printf("\n");
+    printf("  movenow B S E WP WR GAP\n");
+    printf("    Absolute immediate move: write the target pose now, no timing/speed planning. Example:\n");
+    printf("    movenow 0 -30 45 60 0 5.8\n");
+    printf("\n");
+    printf("  deltanow dB dS dE dWP dWR dGAP\n");
+    printf("    Incremental immediate move from current commanded pose. First 5 are deg deltas, last is claw gap cm delta. Example:\n");
+    printf("    deltanow 1 0 0 0 0 0\n");
     printf("\n");
     printf("  zero\n");
     printf("    Move to 0 0 0 0 0 5.8 using current config.\n");
@@ -225,6 +245,7 @@ static void print_config()
 {
     const ArmMotionDurationsMs d = g_motion.get_durations_ms();
     const ArmMotionStrategies s = g_motion.get_strategies();
+    const ArmMotionSpeedStrategies v = g_motion.get_speed_strategies();
 
     printf("\n");
     printf("Current arm_motion config:\n");
@@ -239,7 +260,7 @@ static void print_config()
         static_cast<unsigned>(d.claw_ms)
     );
     printf(
-        "  strategies:    %s %s %s %s %s %s\n",
+        "  duration_style: %s %s %s %s %s %s\n",
         style_to_name(s.base),
         style_to_name(s.shoulder),
         style_to_name(s.elbow),
@@ -247,6 +268,16 @@ static void print_config()
         style_to_name(s.wrist_roll),
         style_to_name(s.claw)
     );
+    printf(
+        "  speed_max:      %.2f %.2f %.2f %.2f %.2f %.2f  (deg/s x5, claw cm/s)\n",
+        static_cast<double>(v.base.max_speed_deg_per_s),
+        static_cast<double>(v.shoulder.max_speed_deg_per_s),
+        static_cast<double>(v.elbow.max_speed_deg_per_s),
+        static_cast<double>(v.wrist_pitch.max_speed_deg_per_s),
+        static_cast<double>(v.wrist_roll.max_speed_deg_per_s),
+        static_cast<double>(v.claw.max_speed_cm_per_s)
+    );
+    printf("  speed_mode:     direct linear speed, no ease-in/ease-out curve\n");
     printf("\n");
 }
 
@@ -515,6 +546,7 @@ static void process_command(char* line)
     }
 
     if (strcmp(line, "stop") == 0) {
+        ESP_LOGW(TAG, "Stop motion and hold current commanded pose via arm_motion.stop_all()");
         const esp_err_t ret = g_motion.stop_all();
         printf("stop_all ret=0x%x\n", static_cast<unsigned>(ret));
         print_state();
@@ -610,6 +642,121 @@ static void process_command(char* line)
 
         printf("set_strategies ret=0x%x\n", static_cast<unsigned>(ret));
         print_config();
+        return;
+    }
+
+    if (starts_with(line, "speed ")) {
+        float values[6] = {};
+        char* args = line + strlen("speed ");
+
+        if (!parse_six_float(args, values)) {
+            printf("Invalid speeds. Usage: speed 45 35 35 50 70 2.5\n");
+            return;
+        }
+
+        const esp_err_t ret = g_motion.set_speed_limits(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5]
+        );
+
+        printf("set_speed_limits ret=0x%x\n", static_cast<unsigned>(ret));
+        print_config();
+        return;
+    }
+
+    if (starts_with(line, "movenow ")) {
+        float values[6] = {};
+        char* args = line + strlen("movenow ");
+
+        if (!parse_six_float(args, values)) {
+            printf("Invalid immediate move target. Usage: movenow 0 -30 45 60 0 5.8\n");
+            return;
+        }
+
+        const esp_err_t ret = g_motion.move_to_immediate(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5]
+        );
+
+        printf("move_to_immediate ret=0x%x\n", static_cast<unsigned>(ret));
+        print_state();
+        return;
+    }
+
+    if (starts_with(line, "deltanow ")) {
+        float values[6] = {};
+        char* args = line + strlen("deltanow ");
+
+        if (!parse_six_float(args, values)) {
+            printf("Invalid delta-immediate command. Usage: deltanow 1 0 0 0 0 0\n");
+            return;
+        }
+
+        const esp_err_t ret = g_motion.move_delta_immediate(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5]
+        );
+
+        printf("move_delta_immediate ret=0x%x\n", static_cast<unsigned>(ret));
+        print_state();
+        return;
+    }
+
+    if (starts_with(line, "movespeed ")) {
+        float values[6] = {};
+        char* args = line + strlen("movespeed ");
+
+        if (!parse_six_float(args, values)) {
+            printf("Invalid speed move target. Usage: movespeed 0 -30 45 60 0 5.8\n");
+            return;
+        }
+
+        const esp_err_t ret = g_motion.move_to_speed(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5]
+        );
+
+        printf("move_to_speed ret=0x%x\n", static_cast<unsigned>(ret));
+        print_state();
+        return;
+    }
+
+    if (starts_with(line, "movev ")) {
+        float values[6] = {};
+        char* args = line + strlen("movev ");
+
+        if (!parse_six_float(args, values)) {
+            printf("Invalid speed move target. Usage: movev 0 -30 45 60 0 5.8\n");
+            return;
+        }
+
+        const esp_err_t ret = g_motion.move_to_speed(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5]
+        );
+
+        printf("move_to_speed ret=0x%x\n", static_cast<unsigned>(ret));
+        print_state();
         return;
     }
 

@@ -5,7 +5,7 @@ idf_component_register(
         "include"
     REQUIRES
         esp_driver_gpio
-        esp_driver_ledc
+        esp_driver_mcpwm
         freertos
         log
 )

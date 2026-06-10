@@ -2,7 +2,6 @@
 
 #include <algorithm>
 
-#include "driver/ledc.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -11,19 +10,13 @@ namespace learm {
 
 static const char* TAG = "servo_pwm";
 
-static constexpr ledc_mode_t kLedcSpeedMode = LEDC_LOW_SPEED_MODE;
-static constexpr ledc_timer_t kLedcTimer = LEDC_TIMER_0;
-static constexpr ledc_timer_bit_t kLedcResolution = LEDC_TIMER_16_BIT;
-static constexpr uint32_t kLedcMaxDuty = (1UL << 16) - 1;
+static constexpr uint32_t kMcpwmResolutionHz = 1000000;  // 1 tick = 1us.
+static constexpr int kMcpwmGroupId = 0;
 
-static constexpr ledc_channel_t kLedcChannels[kServoCount] = {
-    LEDC_CHANNEL_0,
-    LEDC_CHANNEL_1,
-    LEDC_CHANNEL_2,
-    LEDC_CHANNEL_3,
-    LEDC_CHANNEL_4,
-    LEDC_CHANNEL_5,
-};
+static uint8_t channel_to_operator_index(uint8_t index)
+{
+    return static_cast<uint8_t>(index / 2);
+}
 
 int ServoPwm::channel_to_index(ServoChannel channel)
 {
@@ -34,19 +27,6 @@ int ServoPwm::channel_to_index(ServoChannel channel)
     }
 
     return static_cast<int>(index);
-}
-
-uint32_t ServoPwm::pulse_us_to_duty(uint16_t pulse_us) const
-{
-    pulse_us = std::clamp<uint16_t>(
-        pulse_us,
-        kServoMinUs,
-        kServoMaxUs
-    );
-
-    return static_cast<uint32_t>(
-        static_cast<uint64_t>(pulse_us) * kLedcMaxDuty / kServoPeriodUs
-    );
 }
 
 uint16_t ServoPwm::clamp_command_us(uint8_t index, uint16_t pulse_us) const
@@ -84,10 +64,252 @@ uint16_t ServoPwm::apply_offset_and_clamp(uint8_t index, uint16_t command_us) co
     );
 }
 
+esp_err_t ServoPwm::setup_pwm_backend()
+{
+    if (mcpwm_timer_ != nullptr) {
+        return ESP_OK;
+    }
+
+    mcpwm_timer_config_t timer_config = {};
+    timer_config.group_id = kMcpwmGroupId;
+    timer_config.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
+    timer_config.resolution_hz = kMcpwmResolutionHz;
+    timer_config.period_ticks = kServoPeriodUs;
+    timer_config.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
+
+    esp_err_t ret = mcpwm_new_timer(&timer_config, &mcpwm_timer_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "mcpwm_new_timer failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    for (uint8_t i = 0; i < kMcpwmOperatorCount; ++i) {
+        mcpwm_operator_config_t operator_config = {};
+        operator_config.group_id = kMcpwmGroupId;
+
+        ret = mcpwm_new_operator(&operator_config, &mcpwm_operators_[i]);
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "mcpwm_new_operator failed op=%u: %s",
+                static_cast<unsigned>(i),
+                esp_err_to_name(ret)
+            );
+            teardown_pwm_backend();
+            return ret;
+        }
+
+        ret = mcpwm_operator_connect_timer(mcpwm_operators_[i], mcpwm_timer_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "mcpwm_operator_connect_timer failed op=%u: %s",
+                static_cast<unsigned>(i),
+                esp_err_to_name(ret)
+            );
+            teardown_pwm_backend();
+            return ret;
+        }
+    }
+
+    // Do not create generator/comparator resources for disabled channels here.
+    // A configured-but-disabled servo must not emit any PWM pulse.  Channel
+    // resources are created lazily in enable() and destroyed again in disable().
+
+    ret = mcpwm_timer_enable(mcpwm_timer_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "mcpwm_timer_enable failed: %s", esp_err_to_name(ret));
+        teardown_pwm_backend();
+        return ret;
+    }
+
+    ret = mcpwm_timer_start_stop(mcpwm_timer_, MCPWM_TIMER_START_NO_STOP);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "mcpwm_timer_start_stop failed: %s", esp_err_to_name(ret));
+        teardown_pwm_backend();
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "mcpwm servo backend started: group=%d freq=%uHz period=%uus resolution=%uHz",
+             kMcpwmGroupId, kServoFrequencyHz, kServoPeriodUs, kMcpwmResolutionHz);
+
+    return ESP_OK;
+}
+
+void ServoPwm::teardown_pwm_backend()
+{
+    if (mcpwm_timer_ != nullptr) {
+        // Best effort: stop the timer before deleting downstream resources.
+        (void)mcpwm_timer_start_stop(mcpwm_timer_, MCPWM_TIMER_STOP_EMPTY);
+    }
+
+    for (uint8_t i = 0; i < kServoCount; ++i) {
+        destroy_channel_resources(i);
+    }
+
+    for (uint8_t i = 0; i < kMcpwmOperatorCount; ++i) {
+        if (mcpwm_operators_[i] != nullptr) {
+            (void)mcpwm_del_operator(mcpwm_operators_[i]);
+            mcpwm_operators_[i] = nullptr;
+        }
+    }
+
+    if (mcpwm_timer_ != nullptr) {
+        (void)mcpwm_timer_disable(mcpwm_timer_);
+        (void)mcpwm_del_timer(mcpwm_timer_);
+        mcpwm_timer_ = nullptr;
+    }
+}
+
+esp_err_t ServoPwm::create_channel_resources(uint8_t index)
+{
+    if (index >= kServoCount || !states_[index].configured) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (mcpwm_comparators_[index] != nullptr || mcpwm_generators_[index] != nullptr) {
+        return ESP_OK;
+    }
+
+    const uint8_t op_index = channel_to_operator_index(index);
+    if (op_index >= kMcpwmOperatorCount || mcpwm_operators_[op_index] == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const ServoPwmConfig& cfg = states_[index].config;
+
+    mcpwm_comparator_config_t comparator_config = {};
+    comparator_config.flags.update_cmp_on_tez = true;
+
+    esp_err_t ret = mcpwm_new_comparator(
+        mcpwm_operators_[op_index],
+        &comparator_config,
+        &mcpwm_comparators_[index]
+    );
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "mcpwm_new_comparator failed S%u: %s",
+            static_cast<unsigned>(index),
+            esp_err_to_name(ret)
+        );
+        return ret;
+    }
+
+    mcpwm_generator_config_t generator_config = {};
+    generator_config.gen_gpio_num = cfg.gpio;
+
+    ret = mcpwm_new_generator(
+        mcpwm_operators_[op_index],
+        &generator_config,
+        &mcpwm_generators_[index]
+    );
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "mcpwm_new_generator failed S%u gpio=%d: %s",
+            static_cast<unsigned>(index),
+            static_cast<int>(cfg.gpio),
+            esp_err_to_name(ret)
+        );
+        destroy_channel_resources(index);
+        return ret;
+    }
+
+    ret = mcpwm_comparator_set_compare_value(
+        mcpwm_comparators_[index],
+        states_[index].output_us
+    );
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "mcpwm_comparator_set_compare_value failed S%u: %s",
+            static_cast<unsigned>(index),
+            esp_err_to_name(ret)
+        );
+        destroy_channel_resources(index);
+        return ret;
+    }
+
+    ret = mcpwm_generator_set_action_on_timer_event(
+        mcpwm_generators_[index],
+        MCPWM_GEN_TIMER_EVENT_ACTION(
+            MCPWM_TIMER_DIRECTION_UP,
+            MCPWM_TIMER_EVENT_EMPTY,
+            MCPWM_GEN_ACTION_HIGH
+        )
+    );
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "mcpwm_generator_set_action_on_timer_event failed S%u: %s",
+            static_cast<unsigned>(index),
+            esp_err_to_name(ret)
+        );
+        destroy_channel_resources(index);
+        return ret;
+    }
+
+    ret = mcpwm_generator_set_action_on_compare_event(
+        mcpwm_generators_[index],
+        MCPWM_GEN_COMPARE_EVENT_ACTION(
+            MCPWM_TIMER_DIRECTION_UP,
+            mcpwm_comparators_[index],
+            MCPWM_GEN_ACTION_LOW
+        )
+    );
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "mcpwm_generator_set_action_on_compare_event failed S%u: %s",
+            static_cast<unsigned>(index),
+            esp_err_to_name(ret)
+        );
+        destroy_channel_resources(index);
+        return ret;
+    }
+
+    // Keep the generator under normal timer/compare event control.
+    // Do not hold it force-low during init: on ESP32-WROOM this prevented
+    // enabled channels from producing usable servo pulses.
+    ESP_LOGI(
+        TAG,
+        "mcpwm channel S%u gpio=%d op=%u compare=%uus ready",
+        static_cast<unsigned>(index),
+        static_cast<int>(cfg.gpio),
+        static_cast<unsigned>(op_index),
+        states_[index].output_us
+    );
+
+    return ESP_OK;
+}
+
+void ServoPwm::destroy_channel_resources(uint8_t index)
+{
+    if (index >= kServoCount) {
+        return;
+    }
+
+    if (mcpwm_generators_[index] != nullptr) {
+        (void)mcpwm_generator_set_force_level(mcpwm_generators_[index], 0, true);
+        (void)mcpwm_del_generator(mcpwm_generators_[index]);
+        mcpwm_generators_[index] = nullptr;
+    }
+
+    if (mcpwm_comparators_[index] != nullptr) {
+        (void)mcpwm_del_comparator(mcpwm_comparators_[index]);
+        mcpwm_comparators_[index] = nullptr;
+    }
+}
+
 esp_err_t ServoPwm::configure_channel(uint8_t index, uint16_t output_us)
 {
     if (index >= kServoCount || !states_[index].configured) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (mcpwm_comparators_[index] == nullptr || mcpwm_generators_[index] == nullptr) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     const ServoPwmConfig& cfg = states_[index].config;
@@ -98,27 +320,10 @@ esp_err_t ServoPwm::configure_channel(uint8_t index, uint16_t output_us)
         cfg.max_us
     );
 
-    ledc_channel_config_t channel_config = {};
-    channel_config.gpio_num = cfg.gpio;
-    channel_config.speed_mode = kLedcSpeedMode;
-    channel_config.channel = kLedcChannels[index];
-    channel_config.timer_sel = kLedcTimer;
-    channel_config.duty = pulse_us_to_duty(output_us);
-    channel_config.hpoint = 0;
-
-    esp_err_t ret = ledc_channel_config(&channel_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "ledc_channel_config failed index=%u gpio=%d: %s",
-            static_cast<unsigned>(index),
-            static_cast<int>(cfg.gpio),
-            esp_err_to_name(ret)
-        );
-        return ret;
-    }
-
-    return ESP_OK;
+    return mcpwm_comparator_set_compare_value(
+        mcpwm_comparators_[index],
+        output_us
+    );
 }
 
 esp_err_t ServoPwm::write_output_us(uint8_t index, uint16_t output_us)
@@ -139,21 +344,9 @@ esp_err_t ServoPwm::write_output_us(uint8_t index, uint16_t output_us)
         cfg.max_us
     );
 
-    const uint32_t duty = pulse_us_to_duty(output_us);
-
-    esp_err_t ret = ledc_set_duty(
-        kLedcSpeedMode,
-        kLedcChannels[index],
-        duty
-    );
-
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    return ledc_update_duty(
-        kLedcSpeedMode,
-        kLedcChannels[index]
+    return mcpwm_comparator_set_compare_value(
+        mcpwm_comparators_[index],
+        output_us
     );
 }
 
@@ -169,19 +362,6 @@ esp_err_t ServoPwm::init(const ServoPwmConfig* configs, uint8_t count)
 
     for (uint8_t i = 0; i < kServoCount; ++i) {
         states_[i] = ServoState{};
-    }
-
-    ledc_timer_config_t timer_config = {};
-    timer_config.speed_mode = kLedcSpeedMode;
-    timer_config.timer_num = kLedcTimer;
-    timer_config.duty_resolution = kLedcResolution;
-    timer_config.freq_hz = kServoFrequencyHz;
-    timer_config.clk_cfg = LEDC_AUTO_CLK;
-
-    esp_err_t ret = ledc_timer_config(&timer_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ledc_timer_config failed: %s", esp_err_to_name(ret));
-        return ret;
     }
 
     lock_ = xSemaphoreCreateRecursiveMutex();
@@ -234,10 +414,6 @@ esp_err_t ServoPwm::init(const ServoPwmConfig* configs, uint8_t count)
         s.target_us = cfg.reset_us;
         s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), cfg.reset_us);
 
-        gpio_reset_pin(cfg.gpio);
-        gpio_set_direction(cfg.gpio, GPIO_MODE_OUTPUT);
-        gpio_set_level(cfg.gpio, 0);
-
         ESP_LOGI(
             TAG,
             "configured S%u gpio=%d reset=%uus range=[%u,%u] offset=%d disabled",
@@ -250,9 +426,16 @@ esp_err_t ServoPwm::init(const ServoPwmConfig* configs, uint8_t count)
         );
     }
 
+    esp_err_t ret = setup_pwm_backend();
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(lock_);
+        lock_ = nullptr;
+        return ret;
+    }
+
     initialized_ = true;
 
-    ESP_LOGI(TAG, "servo_pwm initialized as pure PWM output layer");
+    ESP_LOGI(TAG, "servo_pwm initialized with MCPWM backend, 50Hz, 1us resolution");
 
     return ESP_OK;
 }
@@ -272,6 +455,7 @@ esp_err_t ServoPwm::deinit()
         } else {
             ret = disable_all();
             initialized_ = false;
+            teardown_pwm_backend();
         }
     }
 
@@ -309,12 +493,18 @@ esp_err_t ServoPwm::enable(ServoChannel channel, uint16_t start_us)
     s.target_us = start_us;
     s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), start_us);
 
-    esp_err_t ret = configure_channel(
+    esp_err_t ret = create_channel_resources(static_cast<uint8_t>(index));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = configure_channel(
         static_cast<uint8_t>(index),
         s.output_us
     );
 
     if (ret != ESP_OK) {
+        destroy_channel_resources(static_cast<uint8_t>(index));
         return ret;
     }
 
@@ -346,22 +536,64 @@ esp_err_t ServoPwm::disable(ServoChannel channel)
 
     ServoState& s = states_[index];
 
-    if (s.enabled) {
-        ledc_stop(kLedcSpeedMode, kLedcChannels[index], 0);
+    const bool had_pwm_resource =
+        (mcpwm_generators_[index] != nullptr) ||
+        (mcpwm_comparators_[index] != nullptr);
 
-        gpio_reset_pin(s.config.gpio);
-        gpio_set_direction(s.config.gpio, GPIO_MODE_OUTPUT);
-        gpio_set_level(s.config.gpio, 0);
+    // Disable must mean "no valid RC-servo pulse on the signal wire".
+    // Never encode disable as an ultra-short pulse: some servos interpret that
+    // as an extreme position command and can slam into mechanical limits.
+    destroy_channel_resources(static_cast<uint8_t>(index));
 
-        ESP_LOGW(
+    const gpio_num_t gpio = s.config.gpio;
+    esp_err_t ret = gpio_reset_pin(gpio);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
             TAG,
-            "disabled S%u gpio=%d",
+            "gpio_reset_pin failed while disabling S%u gpio=%d: %s",
             static_cast<unsigned>(index),
-            static_cast<int>(s.config.gpio)
+            static_cast<int>(gpio),
+            esp_err_to_name(ret)
         );
+        return ret;
+    }
+
+    // Preload the output latch low before switching the pin back to GPIO
+    // output mode, so the signal wire does not briefly produce a high level.
+    ret = gpio_set_level(gpio, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "gpio_set_level failed while disabling S%u gpio=%d: %s",
+            static_cast<unsigned>(index),
+            static_cast<int>(gpio),
+            esp_err_to_name(ret)
+        );
+        return ret;
+    }
+
+    ret = gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "gpio_set_direction failed while disabling S%u gpio=%d: %s",
+            static_cast<unsigned>(index),
+            static_cast<int>(gpio),
+            esp_err_to_name(ret)
+        );
+        return ret;
     }
 
     s.enabled = false;
+
+    if (had_pwm_resource) {
+        ESP_LOGW(
+            TAG,
+            "disabled S%u gpio=%d pwm=off gpio=low",
+            static_cast<unsigned>(index),
+            static_cast<int>(gpio)
+        );
+    }
 
     return ESP_OK;
 }
@@ -451,6 +683,13 @@ esp_err_t ServoPwm::set_config(ServoChannel channel, const ServoPwmConfig& confi
         return ESP_ERR_INVALID_STATE;
     }
 
+    const bool need_recreate = initialized_ &&
+        (mcpwm_generators_[index] != nullptr || mcpwm_comparators_[index] != nullptr);
+
+    if (need_recreate) {
+        destroy_channel_resources(static_cast<uint8_t>(index));
+    }
+
     ServoPwmConfig cfg = config;
     cfg.channel = channel;
 
@@ -470,16 +709,15 @@ esp_err_t ServoPwm::set_config(ServoChannel channel, const ServoPwmConfig& confi
     ServoState& s = states_[index];
 
     s.configured = true;
+    s.enabled = false;
     s.config = cfg;
 
     s.current_us = cfg.reset_us;
     s.target_us = cfg.reset_us;
     s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), cfg.reset_us);
 
-    gpio_reset_pin(cfg.gpio);
-    gpio_set_direction(cfg.gpio, GPIO_MODE_OUTPUT);
-    gpio_set_level(cfg.gpio, 0);
-
+    // Keep configured-but-disabled channels silent.  MCPWM resources are
+    // created lazily by enable(), not by set_config().
     return ESP_OK;
 }
 

@@ -6,4 +6,5 @@ idf_component_register(
     REQUIRES
         arm_joint
         log
+        esp_timer
 )

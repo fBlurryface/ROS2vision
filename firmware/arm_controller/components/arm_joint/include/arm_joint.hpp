@@ -57,9 +57,17 @@ struct JointMotionOptions {
     uint32_t duration_ms = 700;
 
     // timing_mode = Speed 时使用。
-    // 单位：deg/s。
+    // 普通关节单位：deg/s。
+    // 在 arm_motion 的夹爪速度链路中，该字段复用为 cm/s。
     // 注意：这是命令轨迹速度，不是舵机真实速度。
     float speed_deg_per_s = 60.0f;
+
+    // timing_mode = Speed 时使用。
+    // 普通关节单位：deg/s^2。
+    // 在 arm_motion 的夹爪速度链路中，这两个字段复用为 cm/s^2。
+    // 0 表示不做加减速斜坡，直接按 speed_deg_per_s 匀速推进。
+    float accel_deg_per_s2 = 0.0f;
+    float decel_deg_per_s2 = 0.0f;
 
     MotionProfile profile = MotionProfile::SmootherStep;
 

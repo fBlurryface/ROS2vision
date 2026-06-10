@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "driver/gpio.h"
+#include "driver/mcpwm_prelude.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -122,7 +123,7 @@ private:
         uint16_t current_us = 1500;
         uint16_t target_us = 1500;
 
-        // output_us 是实际写入 LEDC 的脉宽，包含 offset 后再限幅。
+        // output_us 是实际写入 PWM 后端的脉宽，包含 offset 后再限幅。
         uint16_t output_us = 1500;
     };
 
@@ -142,6 +143,10 @@ private:
     bool take_lock(TickType_t timeout_ticks = portMAX_DELAY) const;
     void give_lock() const;
 
+    esp_err_t setup_pwm_backend();
+    void teardown_pwm_backend();
+    esp_err_t create_channel_resources(uint8_t index);
+    void destroy_channel_resources(uint8_t index);
     esp_err_t configure_channel(uint8_t index, uint16_t output_us);
     esp_err_t write_output_us(uint8_t index, uint16_t output_us);
 
@@ -150,13 +155,19 @@ private:
 
     static int channel_to_index(ServoChannel channel);
 
-    uint32_t pulse_us_to_duty(uint16_t pulse_us) const;
-
 private:
     bool initialized_ = false;
     SemaphoreHandle_t lock_ = nullptr;
 
     ServoState states_[kServoCount] = {};
+
+    // ESP32 MCPWM: one group has 3 operators, each operator provides two
+    // generator/comparator pairs. This maps exactly to the six servo outputs.
+    static constexpr uint8_t kMcpwmOperatorCount = 3;
+    mcpwm_timer_handle_t mcpwm_timer_ = nullptr;
+    mcpwm_oper_handle_t mcpwm_operators_[kMcpwmOperatorCount] = {};
+    mcpwm_cmpr_handle_t mcpwm_comparators_[kServoCount] = {};
+    mcpwm_gen_handle_t mcpwm_generators_[kServoCount] = {};
 };
 
 }  // namespace learm
