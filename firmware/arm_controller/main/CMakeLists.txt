@@ -7,4 +7,5 @@ idf_component_register(
         servo_pwm
         arm_joint
         arm_motion
+        arm_kinematics
 )

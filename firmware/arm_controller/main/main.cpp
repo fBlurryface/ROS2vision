@@ -13,6 +13,7 @@
 #include "servo_pwm.hpp"
 #include "arm_joint.hpp"
 #include "arm_motion.hpp"
+#include "arm_kinematics.hpp"
 
 using learm::ArmJoint;
 using learm::ArmJointController;
@@ -21,6 +22,11 @@ using learm::ArmMotionDurationsMs;
 using learm::ArmMotionState;
 using learm::ArmMotionStrategies;
 using learm::ArmMotionSpeedStrategies;
+using learm::ArmToolTargetError;
+using learm::ArmKinematics;
+using learm::ArmKinematicsConfig;
+using learm::ArmKinematicsDelta;
+using learm::ArmKinematicsJointState;
 using learm::JointCalibration;
 using learm::JointMotionStyle;
 using learm::JointRuntimeState;
@@ -31,10 +37,71 @@ static const char* TAG = "arm_motion_v5a";
 static ServoPwm g_servo;
 static ArmJointController g_joints;
 static ArmMotion g_motion;
+static ArmKinematics g_kinematics;
 
 static void delay_ms(uint32_t ms)
 {
     vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+static ArmKinematicsConfig make_default_kinematics_config()
+{
+    ArmKinematicsConfig config;
+
+    // Measured linkage geometry for incremental Jacobian testing.
+    // LINKAGE_1: base -> shoulder plane vertical offset.
+    // LINKAGE_2: shoulder -> elbow.
+    // LINKAGE_3: elbow -> wrist_pitch.
+    // LINKAGE_4: wrist_pitch -> TCP / claw reference point.
+    config.base_to_shoulder_z_mm = 28.9f;
+    config.upper_arm_mm = 104.3f;
+    config.forearm_mm = 89.0f;
+    config.wrist_to_tool_mm = 177.0f;
+
+    // Semantic joint angle -> kinematic model angle mapping.
+    // If jtool direction is inverted for a joint, tune the corresponding sign.
+    config.base_sign = 1.0f;
+    config.shoulder_sign = 1.0f;
+    config.elbow_sign = 1.0f;
+    config.wrist_pitch_sign = 1.0f;
+    config.wrist_roll_sign = 1.0f;
+
+    config.base_offset_deg = 0.0f;
+    config.shoulder_offset_deg = 0.0f;
+    config.elbow_offset_deg = 0.0f;
+    config.wrist_pitch_offset_deg = 0.0f;
+    config.wrist_roll_offset_deg = 0.0f;
+
+    // Purpose-built tool target solver.
+    config.lateral_gain = 0.45f;
+    config.longitudinal_gain = 0.35f;
+    config.up_gain = 0.30f;
+
+    config.lateral_damping_mm = 35.0f;
+    config.longitudinal_damping_mm = 35.0f;
+    config.up_damping_mm = 35.0f;
+
+    config.planar_hold_min_effect_mm2 = 1.0f;
+    config.relaxed_orientation_weight_mm = 10.0f;
+
+    config.max_error_mm = 20.0f;
+    config.max_delta_deg_base = 1.0f;
+    config.max_delta_deg_shoulder = 1.0f;
+    config.max_delta_deg_elbow = 1.0f;
+    config.max_delta_deg_wrist_pitch = 1.0f;
+    config.max_delta_deg_wrist_roll = 1.0f;
+
+    // Keep these synchronized with arm_joint_defaults::kJointCalibrations.
+    config.min_deg_base = -85.0f;
+    config.max_deg_base = 85.0f;
+    config.min_deg_shoulder = -85.0f;
+    config.max_deg_shoulder = 85.0f;
+    config.min_deg_elbow = -85.0f;
+    config.max_deg_elbow = 85.0f;
+    config.min_deg_wrist_pitch = -85.0f;
+    config.max_deg_wrist_pitch = 85.0f;
+
+    return config;
 }
 
 static void trim_line(char* line)
@@ -160,6 +227,20 @@ static const char* joint_to_name(ArmJoint joint)
     }
 }
 
+static ArmKinematicsJointState current_kinematics_joints()
+{
+    const ArmMotionState state = g_motion.get_state();
+
+    ArmKinematicsJointState joints;
+    joints.base_deg = state.base.current_deg;
+    joints.shoulder_deg = state.shoulder.current_deg;
+    joints.elbow_deg = state.elbow.current_deg;
+    joints.wrist_pitch_deg = state.wrist_pitch.current_deg;
+    joints.wrist_roll_deg = state.wrist_roll.current_deg;
+
+    return joints;
+}
+
 static void print_help()
 {
     printf("\n");
@@ -214,6 +295,13 @@ static void print_help()
     printf("  deltanow dB dS dE dWP dWR dGAP\n");
     printf("    Incremental immediate move from current commanded pose. First 5 are deg deltas, last is claw gap cm delta. Example:\n");
     printf("    deltanow 1 0 0 0 0 0\n");
+    printf("\n");
+    printf("  jtool F L U [D]\n");
+    printf("    Purpose-built f-link target solver, mm. F/L/U are target point coordinates\n");
+    printf("    in the current f-link frame; optional D is desired forward distance.\n");
+    printf("    left -> base yaw; forward/up -> C/D/E planar translation\n");
+    printf("    with f-pitch hold first, relaxed only when ineffective. Example:\n");
+    printf("    jtool 10 0 0 0\n");
     printf("\n");
     printf("  zero\n");
     printf("    Move to 0 0 0 0 0 5.8 using current config.\n");
@@ -366,6 +454,31 @@ static bool parse_six_float(char* args, float out[6])
     }
 
     for (int i = 0; i < 6; ++i) {
+        char* token = strtok(i == 0 ? args : nullptr, " \t");
+        if (token == nullptr) {
+            return false;
+        }
+
+        char* end = nullptr;
+        const float value = strtof(token, &end);
+
+        if (end == token || *end != '\0') {
+            return false;
+        }
+
+        out[i] = value;
+    }
+
+    return strtok(nullptr, " \t") == nullptr;
+}
+
+static bool parse_three_float(char* args, float out[3])
+{
+    if (args == nullptr || out == nullptr) {
+        return false;
+    }
+
+    for (int i = 0; i < 3; ++i) {
         char* token = strtok(i == 0 ? args : nullptr, " \t");
         if (token == nullptr) {
             return false;
@@ -714,6 +827,68 @@ static void process_command(char* line)
         return;
     }
 
+    if (starts_with(line, "jtool ") || starts_with(line, "jcam ")) {
+        float values[4] = {};
+        char* args = starts_with(line, "jtool ")
+            ? line + strlen("jtool ")
+            : line + strlen("jcam ");
+
+        const int parsed = sscanf(
+            args,
+            "%f %f %f %f",
+            &values[0],
+            &values[1],
+            &values[2],
+            &values[3]
+        );
+        if (parsed < 3) {
+            printf("Invalid tool target error. Usage: jtool F L U [desired_forward]\n");
+            return;
+        }
+
+        const ArmKinematicsJointState joints = current_kinematics_joints();
+
+        ArmToolTargetError error;
+        error.forward_mm = values[0];
+        error.left_mm = values[1];
+        error.up_mm = values[2];
+        error.desired_forward_mm = (parsed >= 4) ? values[3] : 0.0f;
+
+        ArmKinematicsDelta delta;
+        const esp_err_t solve_ret = g_kinematics.solve_tool_target_delta(
+            joints,
+            error,
+            &delta
+        );
+
+        printf("solve_tool_target_delta ret=0x%x\n", static_cast<unsigned>(solve_ret));
+        if (solve_ret != ESP_OK) {
+            return;
+        }
+
+        printf(
+            "tool delta deg: base=%+.3f shoulder=%+.3f elbow=%+.3f wrist_pitch=%+.3f wrist_roll=%+.3f\n",
+            static_cast<double>(delta.base_delta_deg),
+            static_cast<double>(delta.shoulder_delta_deg),
+            static_cast<double>(delta.elbow_delta_deg),
+            static_cast<double>(delta.wrist_pitch_delta_deg),
+            static_cast<double>(delta.wrist_roll_delta_deg)
+        );
+
+        const esp_err_t move_ret = g_motion.move_delta_immediate(
+            delta.base_delta_deg,
+            delta.shoulder_delta_deg,
+            delta.elbow_delta_deg,
+            delta.wrist_pitch_delta_deg,
+            delta.wrist_roll_delta_deg,
+            0.0f
+        );
+
+        printf("move_delta_immediate ret=0x%x\n", static_cast<unsigned>(move_ret));
+        print_state();
+        return;
+    }
+
     if (starts_with(line, "movespeed ")) {
         float values[6] = {};
         char* args = line + strlen("movespeed ");
@@ -828,6 +1003,7 @@ extern "C" void app_main(void)
     );
 
     ESP_ERROR_CHECK(g_motion.init(&g_joints));
+    ESP_ERROR_CHECK(g_kinematics.init(make_default_kinematics_config()));
 
     ESP_LOGW(TAG, "SAFE MODE: servo_pwm initialized, joints still disabled");
     delay_ms(3000);
