@@ -1,107 +1,82 @@
+#include <algorithm>
+#include <cmath>
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#include "servo_pwm.hpp"
 #include "arm_joint.hpp"
-#include "arm_motion.hpp"
 #include "arm_kinematics.hpp"
+#include "arm_motion.hpp"
+#include "servo_pwm.hpp"
 
+using learm::ArmCartesianPose;
 using learm::ArmJoint;
 using learm::ArmJointController;
-using learm::ArmMotion;
-using learm::ArmMotionDurationsMs;
-using learm::ArmMotionState;
-using learm::ArmMotionStrategies;
-using learm::ArmMotionSpeedStrategies;
-using learm::ArmToolTargetError;
 using learm::ArmKinematics;
-using learm::ArmKinematicsConfig;
-using learm::ArmKinematicsDelta;
+using learm::ArmKinematicsJointMask;
 using learm::ArmKinematicsJointState;
+using learm::ArmKinematicsJointVelocity;
+using learm::ArmMotion;
+using learm::ArmMotionCommand;
+using learm::ArmMotionJointVelocity;
+using learm::ArmMotionMode;
+using learm::ArmMotionPositionCommand;
+using learm::ArmMotionState;
+using learm::ArmOutputState;
+using learm::ArmToolVelocity;
 using learm::JointCalibration;
-using learm::JointMotionStyle;
-using learm::JointRuntimeState;
 using learm::ServoPwm;
 
-static const char* TAG = "arm_motion_v5a";
+static const char* TAG = "jerr_pos_vel_experiment";
 
 static ServoPwm g_servo;
 static ArmJointController g_joints;
 static ArmMotion g_motion;
 static ArmKinematics g_kinematics;
 
+// Application-level command ownership. Track is the default source. A valid
+// pos command temporarily owns ArmMotion until an explicit stop returns
+// control to Track. ArmMotionMode still describes command execution itself.
+enum class AppControlMode : uint8_t {
+    Track = 0,
+    Pos,
+};
+
+static AppControlMode g_app_control_mode = AppControlMode::Track;
+static bool g_jerr_ignore_reported = false;
+
+// One fixed visual-error-to-tool-velocity parameter group.
+// jerr inputs are dimensionless normalized errors in [-1, 1].
+struct VisualVelocityParameters {
+    float forward_gain_mm_per_s = 30.0f;
+    float left_gain_mm_per_s = 220.0f;
+    float up_gain_mm_per_s = 300.0f;
+    float pitch_gain_deg_per_s = 20.0f;
+
+    float max_forward_mm_per_s = 30.0f;
+    float max_left_mm_per_s = 150.0f;
+    float max_up_mm_per_s = 200.0f;
+    float max_pitch_deg_per_s = 20.0f;
+};
+
+static constexpr VisualVelocityParameters kVisualVelocity = {};
+
+// The physical arm must be placed near this pose before power-on. This first
+// command becomes the motion layer's initial software reference.
+static constexpr ArmMotionPositionCommand kInitialPose = {
+    {0.0f, -60.0f, 70.0f, 70.0f, 0.0f},
+    0.0f,
+};
+
 static void delay_ms(uint32_t ms)
 {
     vTaskDelay(pdMS_TO_TICKS(ms));
-}
-
-static ArmKinematicsConfig make_default_kinematics_config()
-{
-    ArmKinematicsConfig config;
-
-    // Measured linkage geometry for incremental Jacobian testing.
-    // LINKAGE_1: base -> shoulder plane vertical offset.
-    // LINKAGE_2: shoulder -> elbow.
-    // LINKAGE_3: elbow -> wrist_pitch.
-    // LINKAGE_4: wrist_pitch -> TCP / claw reference point.
-    config.base_to_shoulder_z_mm = 28.9f;
-    config.upper_arm_mm = 104.3f;
-    config.forearm_mm = 89.0f;
-    config.wrist_to_tool_mm = 177.0f;
-
-    // Semantic joint angle -> kinematic model angle mapping.
-    // If jtool direction is inverted for a joint, tune the corresponding sign.
-    config.base_sign = 1.0f;
-    config.shoulder_sign = 1.0f;
-    config.elbow_sign = 1.0f;
-    config.wrist_pitch_sign = 1.0f;
-    config.wrist_roll_sign = 1.0f;
-
-    config.base_offset_deg = 0.0f;
-    config.shoulder_offset_deg = 0.0f;
-    config.elbow_offset_deg = 0.0f;
-    config.wrist_pitch_offset_deg = 0.0f;
-    config.wrist_roll_offset_deg = 0.0f;
-
-    // Purpose-built tool target solver.
-    config.lateral_gain = 0.45f;
-    config.longitudinal_gain = 0.35f;
-    config.up_gain = 0.30f;
-
-    config.lateral_damping_mm = 35.0f;
-    config.longitudinal_damping_mm = 35.0f;
-    config.up_damping_mm = 35.0f;
-
-    config.planar_hold_min_effect_mm2 = 1.0f;
-    config.relaxed_orientation_weight_mm = 10.0f;
-
-    config.max_error_mm = 20.0f;
-    config.max_delta_deg_base = 1.0f;
-    config.max_delta_deg_shoulder = 1.0f;
-    config.max_delta_deg_elbow = 1.0f;
-    config.max_delta_deg_wrist_pitch = 1.0f;
-    config.max_delta_deg_wrist_roll = 1.0f;
-
-    // Keep these synchronized with arm_joint_defaults::kJointCalibrations.
-    config.min_deg_base = -85.0f;
-    config.max_deg_base = 85.0f;
-    config.min_deg_shoulder = -85.0f;
-    config.max_deg_shoulder = 85.0f;
-    config.min_deg_elbow = -85.0f;
-    config.max_deg_elbow = 85.0f;
-    config.min_deg_wrist_pitch = -85.0f;
-    config.max_deg_wrist_pitch = 85.0f;
-
-    return config;
 }
 
 static void trim_line(char* line)
@@ -111,927 +86,571 @@ static void trim_line(char* line)
     }
 
     size_t len = strlen(line);
-
-    while (len > 0 &&
-           (line[len - 1] == '\n' ||
-            line[len - 1] == '\r' ||
-            isspace(static_cast<unsigned char>(line[len - 1])))) {
-        line[len - 1] = '\0';
-        len--;
+    while (len > 0 && isspace(static_cast<unsigned char>(line[len - 1]))) {
+        line[--len] = '\0';
     }
 
-    char* start = line;
-
-    while (*start != '\0' &&
-           isspace(static_cast<unsigned char>(*start))) {
-        start++;
+    char* first = line;
+    while (*first != '\0' && isspace(static_cast<unsigned char>(*first))) {
+        ++first;
     }
-
-    if (start != line) {
-        memmove(line, start, strlen(start) + 1);
+    if (first != line) {
+        memmove(line, first, strlen(first) + 1);
     }
 }
 
-static bool starts_with(const char* s, const char* prefix)
+static bool has_command_prefix(const char* line, const char* command)
 {
-    if (s == nullptr || prefix == nullptr) {
+    if (line == nullptr || command == nullptr) {
         return false;
     }
 
-    return strncmp(s, prefix, strlen(prefix)) == 0;
+    const size_t length = strlen(command);
+    return strncmp(line, command, length) == 0 &&
+           (line[length] == '\0' ||
+            isspace(static_cast<unsigned char>(line[length])));
 }
 
-static bool equals_ignore_case(const char* a, const char* b)
+static const char* app_control_mode_name(AppControlMode mode)
 {
-    if (a == nullptr || b == nullptr) {
+    switch (mode) {
+        case AppControlMode::Track: return "track";
+        case AppControlMode::Pos:   return "pos";
+        default:                    return "unknown";
+    }
+}
+
+static void enter_track_mode()
+{
+    g_app_control_mode = AppControlMode::Track;
+    g_jerr_ignore_reported = false;
+}
+
+static void enter_pos_mode()
+{
+    g_app_control_mode = AppControlMode::Pos;
+    g_jerr_ignore_reported = false;
+}
+
+static bool parse_position_command(
+    const char* line,
+    ArmMotionPositionCommand* command
+)
+{
+    if (line == nullptr || command == nullptr) {
         return false;
     }
 
-    while (*a != '\0' && *b != '\0') {
-        const int ca = tolower(static_cast<unsigned char>(*a));
-        const int cb = tolower(static_cast<unsigned char>(*b));
+    int consumed = -1;
+    const int matched = sscanf(
+        line,
+        "pos %f %f %f %f %f %f%n",
+        &command->joint_position.base_deg,
+        &command->joint_position.shoulder_deg,
+        &command->joint_position.elbow_deg,
+        &command->joint_position.wrist_pitch_deg,
+        &command->joint_position.wrist_roll_deg,
+        &command->claw_gap_cm,
+        &consumed
+    );
 
-        if (ca != cb) {
-            return false;
-        }
-
-        a++;
-        b++;
-    }
-
-    return *a == '\0' && *b == '\0';
+    return matched == 6 && consumed >= 0 && line[consumed] == '\0';
 }
 
-static const char* style_to_name(JointMotionStyle style)
+static bool parse_normalized_error_command(
+    const char* line,
+    float* forward_error,
+    float* left_error,
+    float* up_error,
+    float* pitch_error
+)
 {
-    switch (style) {
-        case JointMotionStyle::Linear:
-            return "linear";
-
-        case JointMotionStyle::Smooth:
-            return "smooth";
-
-        case JointMotionStyle::Soft:
-        default:
-            return "soft";
-    }
-}
-
-static bool parse_style_token(const char* token, JointMotionStyle* style)
-{
-    if (token == nullptr || style == nullptr) {
+    if (line == nullptr || forward_error == nullptr || left_error == nullptr ||
+        up_error == nullptr || pitch_error == nullptr) {
         return false;
     }
 
-    if (equals_ignore_case(token, "linear") || strcmp(token, "0") == 0) {
-        *style = JointMotionStyle::Linear;
-        return true;
-    }
+    int consumed = -1;
+    const int matched = sscanf(
+        line,
+        "jerr %f %f %f %f%n",
+        forward_error,
+        left_error,
+        up_error,
+        pitch_error,
+        &consumed
+    );
 
-    if (equals_ignore_case(token, "smooth") || strcmp(token, "1") == 0) {
-        *style = JointMotionStyle::Smooth;
-        return true;
-    }
-
-    if (equals_ignore_case(token, "soft") || strcmp(token, "2") == 0) {
-        *style = JointMotionStyle::Soft;
-        return true;
-    }
-
-    return false;
+    return matched == 4 && consumed >= 0 && line[consumed] == '\0' &&
+           std::isfinite(*forward_error) &&
+           std::isfinite(*left_error) &&
+           std::isfinite(*up_error) &&
+           std::isfinite(*pitch_error);
 }
 
-static const char* joint_to_name(ArmJoint joint)
+static const char* mode_name(ArmMotionMode mode)
+{
+    switch (mode) {
+        case ArmMotionMode::Hold:     return "hold";
+        case ArmMotionMode::Position: return "position";
+        case ArmMotionMode::Velocity: return "velocity";
+        case ArmMotionMode::Stopping: return "stopping";
+        default:                      return "unknown";
+    }
+}
+
+static const char* output_state_name(ArmOutputState state)
+{
+    switch (state) {
+        case ArmOutputState::Disabled:    return "disabled";
+        case ArmOutputState::Enabled:     return "enabled";
+        case ArmOutputState::DriverError: return "driver_error";
+        default:                          return "unknown";
+    }
+}
+
+static const char* joint_name(ArmJoint joint)
 {
     switch (joint) {
-        case ArmJoint::Base:
-            return "Base";
-
-        case ArmJoint::Shoulder:
-            return "Shoulder";
-
-        case ArmJoint::Elbow:
-            return "Elbow";
-
-        case ArmJoint::WristPitch:
-            return "WristPitch";
-
-        case ArmJoint::WristRoll:
-            return "WristRoll";
-
-        case ArmJoint::Claw:
-            return "Claw";
-
-        default:
-            return "Unknown";
+        case ArmJoint::Claw:       return "claw";
+        case ArmJoint::WristRoll:  return "wrist_roll";
+        case ArmJoint::WristPitch: return "wrist_pitch";
+        case ArmJoint::Elbow:      return "elbow";
+        case ArmJoint::Shoulder:   return "shoulder";
+        case ArmJoint::Base:       return "base";
+        default:                   return "unknown";
     }
 }
 
-static ArmKinematicsJointState current_kinematics_joints()
+static ArmKinematicsJointState kinematics_state_from_motion(const ArmMotionState& state)
 {
-    const ArmMotionState state = g_motion.get_state();
+    ArmKinematicsJointState result;
+    result.base_deg = state.base.reference_deg;
+    result.shoulder_deg = state.shoulder.reference_deg;
+    result.elbow_deg = state.elbow.reference_deg;
+    result.wrist_pitch_deg = state.wrist_pitch.reference_deg;
+    result.wrist_roll_deg = state.wrist_roll.reference_deg;
+    return result;
+}
 
-    ArmKinematicsJointState joints;
-    joints.base_deg = state.base.current_deg;
-    joints.shoulder_deg = state.shoulder.current_deg;
-    joints.elbow_deg = state.elbow.current_deg;
-    joints.wrist_pitch_deg = state.wrist_pitch.current_deg;
-    joints.wrist_roll_deg = state.wrist_roll.current_deg;
+static ArmMotionJointVelocity motion_velocity_from_kinematics(
+    const ArmKinematicsJointVelocity& velocity
+)
+{
+    ArmMotionJointVelocity result;
+    result.base_deg_per_s = velocity.base_deg_per_s;
+    result.shoulder_deg_per_s = velocity.shoulder_deg_per_s;
+    result.elbow_deg_per_s = velocity.elbow_deg_per_s;
+    result.wrist_pitch_deg_per_s = velocity.wrist_pitch_deg_per_s;
+    result.wrist_roll_deg_per_s = velocity.wrist_roll_deg_per_s;
+    return result;
+}
 
-    return joints;
+static float normalized_error(float value)
+{
+    if (!std::isfinite(value)) {
+        return 0.0f;
+    }
+    return std::clamp(value, -1.0f, 1.0f);
+}
+
+static ArmToolVelocity tool_velocity_from_error(
+    float forward_error,
+    float left_error,
+    float up_error,
+    float pitch_error
+)
+{
+    const float ef = normalized_error(forward_error);
+    const float el = normalized_error(left_error);
+    const float eu = normalized_error(up_error);
+    const float ep = normalized_error(pitch_error);
+
+    ArmToolVelocity velocity;
+    velocity.forward_mm_per_s = std::clamp(
+        kVisualVelocity.forward_gain_mm_per_s * ef,
+        -kVisualVelocity.max_forward_mm_per_s,
+         kVisualVelocity.max_forward_mm_per_s
+    );
+    velocity.left_mm_per_s = std::clamp(
+        kVisualVelocity.left_gain_mm_per_s * el,
+        -kVisualVelocity.max_left_mm_per_s,
+         kVisualVelocity.max_left_mm_per_s
+    );
+    velocity.up_mm_per_s = std::clamp(
+        kVisualVelocity.up_gain_mm_per_s * eu,
+        -kVisualVelocity.max_up_mm_per_s,
+         kVisualVelocity.max_up_mm_per_s
+    );
+    velocity.pitch_deg_per_s = std::clamp(
+        kVisualVelocity.pitch_gain_deg_per_s * ep,
+        -kVisualVelocity.max_pitch_deg_per_s,
+         kVisualVelocity.max_pitch_deg_per_s
+    );
+    velocity.roll_deg_per_s = 0.0f;
+    return velocity;
+}
+
+static constexpr float kActiveSetLimitEpsilonDeg = 0.001f;
+static constexpr float kActiveSetVelocityEpsilonDegPerS = 0.001f;
+
+static bool disable_if_moving_outward_at_limit(
+    float reference_deg,
+    float velocity_deg_per_s,
+    learm::ArmJoint joint,
+    bool* enabled
+)
+{
+    if (enabled == nullptr || !*enabled) {
+        return false;
+    }
+
+    const JointCalibration calibration = g_joints.get_calibration(joint);
+    const bool outward_at_min =
+        reference_deg <= calibration.min_deg + kActiveSetLimitEpsilonDeg &&
+        velocity_deg_per_s < -kActiveSetVelocityEpsilonDegPerS;
+    const bool outward_at_max =
+        reference_deg >= calibration.max_deg - kActiveSetLimitEpsilonDeg &&
+        velocity_deg_per_s > kActiveSetVelocityEpsilonDegPerS;
+
+    if (!outward_at_min && !outward_at_max) {
+        return false;
+    }
+
+    *enabled = false;
+    return true;
+}
+
+static bool remove_outward_limited_joints(
+    const ArmMotionState& state,
+    const ArmKinematicsJointVelocity& velocity,
+    ArmKinematicsJointMask* enabled_joints
+)
+{
+    if (enabled_joints == nullptr) {
+        return false;
+    }
+
+    bool changed = false;
+    changed |= disable_if_moving_outward_at_limit(
+        state.base.reference_deg,
+        velocity.base_deg_per_s,
+        learm::ArmJoint::Base,
+        &enabled_joints->base
+    );
+    changed |= disable_if_moving_outward_at_limit(
+        state.shoulder.reference_deg,
+        velocity.shoulder_deg_per_s,
+        learm::ArmJoint::Shoulder,
+        &enabled_joints->shoulder
+    );
+    changed |= disable_if_moving_outward_at_limit(
+        state.elbow.reference_deg,
+        velocity.elbow_deg_per_s,
+        learm::ArmJoint::Elbow,
+        &enabled_joints->elbow
+    );
+    changed |= disable_if_moving_outward_at_limit(
+        state.wrist_pitch.reference_deg,
+        velocity.wrist_pitch_deg_per_s,
+        learm::ArmJoint::WristPitch,
+        &enabled_joints->wrist_pitch
+    );
+    changed |= disable_if_moving_outward_at_limit(
+        state.wrist_roll.reference_deg,
+        velocity.wrist_roll_deg_per_s,
+        learm::ArmJoint::WristRoll,
+        &enabled_joints->wrist_roll
+    );
+    return changed;
+}
+
+static esp_err_t apply_normalized_error(
+    float forward_error,
+    float left_error,
+    float up_error,
+    float pitch_error
+)
+{
+    const ArmMotionState motion_state = g_motion.get_state();
+    if (!motion_state.initialized ||
+        motion_state.output_state != ArmOutputState::Enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const ArmKinematicsJointState joints =
+        kinematics_state_from_motion(motion_state);
+    const ArmToolVelocity tool_velocity = tool_velocity_from_error(
+        forward_error,
+        left_error,
+        up_error,
+        pitch_error
+    );
+
+    ArmKinematicsJointMask enabled_joints;
+    ArmKinematicsJointVelocity solved_velocity;
+    bool solved = false;
+
+    // Small active-set loop: if the current solution asks a joint already at
+    // its limit to move farther outward, constrain that joint to zero and run
+    // the same Jacobian solver again with the remaining joints. Multiple
+    // joints may be removed in one pass. Six solves are sufficient for five
+    // rotary joints, including the final all-constrained solution.
+    for (int pass = 0; pass < 6; ++pass) {
+        const esp_err_t solve_ret = g_kinematics.solve_tool_velocity(
+            joints,
+            tool_velocity,
+            enabled_joints,
+            &solved_velocity
+        );
+        if (solve_ret != ESP_OK) {
+            g_motion.stop();
+            return solve_ret;
+        }
+
+        if (!remove_outward_limited_joints(
+                motion_state,
+                solved_velocity,
+                &enabled_joints)) {
+            solved = true;
+            break;
+        }
+    }
+
+    if (!solved) {
+        g_motion.stop();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ArmMotionCommand motion_command;
+    motion_command.joint_velocity =
+        motion_velocity_from_kinematics(solved_velocity);
+    motion_command.claw_gap_cm = motion_state.claw_target_gap_cm;
+    return g_motion.command(motion_command);
 }
 
 static void print_help()
 {
-    printf("\n");
-    printf("========== arm_motion V5A motion-owned test ==========\n");
-    printf("\n");
-    printf("This test uses:\n");
-    printf("  g_motion.enable_all()\n");
-    printf("  g_motion.set_durations_ms(...)\n");
-    printf("  g_motion.set_strategies(...)\n");
-    printf("  g_motion.move_to(...)\n");
-    printf("  g_motion.move_to_speed(...)\n");
-    printf("  g_motion.move_to_immediate(...)\n");
-    printf("  g_motion.move_delta_immediate(...)\n");
-    printf("\n");
-    printf("Axis order:\n");
-    printf("  base shoulder elbow wrist_pitch wrist_roll claw\n");
-    printf("\n");
-    printf("Commands:\n");
-    printf("  help        print this help\n");
-    printf("  enable      initialize/enable all joints at default calibration pose\n");
-    printf("  stop        stop current motion and hold current commanded pose\n");
-    printf("  disable     stop motion and turn PWM output off; torque release is not guaranteed\n");
-    printf("  default     print default enable pulse / calibration\n");
-    printf("  config      print current durations and strategies\n");
-    printf("  state       print arm_motion state\n");
-    printf("  ready       print ready / moving state\n");
-    printf("\n");
-    printf("  dur B S E WP WR C\n");
-    printf("    Set durations in ms. Example:\n");
-    printf("    dur 1000 1200 1200 800 600 500\n");
-    printf("\n");
-    printf("  style B S E WP WR C\n");
-    printf("    Set duration-line styles. Use linear/smooth/soft or 0/1/2. Example:\n");
-    printf("    style smooth soft soft smooth smooth smooth\n");
-    printf("\n");
-    printf("  speed B S E WP WR C\n");
-    printf("    Set speed-line max speeds. First 5 are deg/s, last is claw cm/s. Example:\n");
-    printf("    speed 45 35 35 50 70 2.5\n");
-    printf("\n");
-    printf("  move B S E WP WR GAP\n");
-    printf("    Duration-line move. First 5 are degrees, last is claw gap cm. Example:\n");
-    printf("    move 0 -30 45 60 0 5.8\n");
-    printf("\n");
-    printf("  movespeed B S E WP WR GAP\n");
-    printf("    Speed-line move using configured max speeds, direct linear speed. Example:\n");
-    printf("    movespeed 0 -30 45 60 0 5.8\n");
-    printf("\n");
-    printf("  movenow B S E WP WR GAP\n");
-    printf("    Absolute immediate move: write the target pose now, no timing/speed planning. Example:\n");
-    printf("    movenow 0 -30 45 60 0 5.8\n");
-    printf("\n");
-    printf("  deltanow dB dS dE dWP dWR dGAP\n");
-    printf("    Incremental immediate move from current commanded pose. First 5 are deg deltas, last is claw gap cm delta. Example:\n");
-    printf("    deltanow 1 0 0 0 0 0\n");
-    printf("\n");
-    printf("  jtool F L U [D]\n");
-    printf("    Purpose-built f-link target solver, mm. F/L/U are target point coordinates\n");
-    printf("    in the current f-link frame; optional D is desired forward distance.\n");
-    printf("    left -> base yaw; forward/up -> C/D/E planar translation\n");
-    printf("    with f-pitch hold first, relaxed only when ineffective. Example:\n");
-    printf("    jtool 10 0 0 0\n");
-    printf("\n");
-    printf("  zero\n");
-    printf("    Move to 0 0 0 0 0 5.8 using current config.\n");
-    printf("\n");
-    printf("  demo\n");
-    printf("    Run a short group-motion sequence.\n");
-    printf("\n");
-    printf("==================================================\n");
-    printf("\n");
-}
-
-static void print_joint_state(const char* label, const JointRuntimeState& s)
-{
-    printf(
-        "  %-10s enabled=%d running=%d ready=%d current=%7.2fdeg target=%7.2fdeg us=%4u->%4u out=%4u\n",
-        label,
-        static_cast<int>(s.enabled),
-        static_cast<int>(s.running),
-        static_cast<int>(s.ready),
-        static_cast<double>(s.current_deg),
-        static_cast<double>(s.target_deg),
-        static_cast<unsigned>(s.current_us),
-        static_cast<unsigned>(s.target_us),
-        static_cast<unsigned>(s.output_us)
-    );
-}
-
-static void print_config()
-{
-    const ArmMotionDurationsMs d = g_motion.get_durations_ms();
-    const ArmMotionStrategies s = g_motion.get_strategies();
-    const ArmMotionSpeedStrategies v = g_motion.get_speed_strategies();
-
-    printf("\n");
-    printf("Current arm_motion config:\n");
-    printf("  order: base shoulder elbow wrist_pitch wrist_roll claw\n");
-    printf(
-        "  durations_ms: %u %u %u %u %u %u\n",
-        static_cast<unsigned>(d.base_ms),
-        static_cast<unsigned>(d.shoulder_ms),
-        static_cast<unsigned>(d.elbow_ms),
-        static_cast<unsigned>(d.wrist_pitch_ms),
-        static_cast<unsigned>(d.wrist_roll_ms),
-        static_cast<unsigned>(d.claw_ms)
-    );
-    printf(
-        "  duration_style: %s %s %s %s %s %s\n",
-        style_to_name(s.base),
-        style_to_name(s.shoulder),
-        style_to_name(s.elbow),
-        style_to_name(s.wrist_pitch),
-        style_to_name(s.wrist_roll),
-        style_to_name(s.claw)
-    );
-    printf(
-        "  speed_max:      %.2f %.2f %.2f %.2f %.2f %.2f  (deg/s x5, claw cm/s)\n",
-        static_cast<double>(v.base.max_speed_deg_per_s),
-        static_cast<double>(v.shoulder.max_speed_deg_per_s),
-        static_cast<double>(v.elbow.max_speed_deg_per_s),
-        static_cast<double>(v.wrist_pitch.max_speed_deg_per_s),
-        static_cast<double>(v.wrist_roll.max_speed_deg_per_s),
-        static_cast<double>(v.claw.max_speed_cm_per_s)
-    );
-    printf("  speed_mode:     direct linear speed, no ease-in/ease-out curve\n");
-    printf("\n");
-}
-
-static void print_default_enable_pulses()
-{
-    printf("\n");
-    printf("Default enable positions from arm_joint calibration:\n");
-
-    const ArmJoint order[] = {
-        ArmJoint::Base,
-        ArmJoint::Shoulder,
-        ArmJoint::Elbow,
-        ArmJoint::WristPitch,
-        ArmJoint::WristRoll,
-        ArmJoint::Claw,
-    };
-
-    for (ArmJoint joint : order) {
-        const JointCalibration cal = g_joints.get_calibration(joint);
-
-        printf(
-            "  %-10s zero_deg=%7.2f zero_us=%4u range=[%7.2f,%7.2f]\n",
-            joint_to_name(joint),
-            static_cast<double>(cal.zero_deg),
-            static_cast<unsigned>(cal.zero_us),
-            static_cast<double>(cal.min_deg),
-            static_cast<double>(cal.max_deg)
-        );
-    }
-
-    printf("  Claw zero_us=500us is max open, about 5.8cm gap.\n");
-    printf("\n");
+    printf("\n=== normalized-error position + velocity experiment ===\n");
+    printf("Default tracking protocol:\n");
+    printf("  jerr F L U P\n");
+    printf("    F/L/U/P are dimensionless normalized errors in [-1, 1].\n");
+    printf("    The hand tracker sends only L/U: jerr 0 L U 0.\n");
+    printf("    Accepted in Track mode; refreshes the velocity watchdog.\n\n");
+    printf("Position override:\n");
+    printf("  pos B S E WP WR GAP\n");
+    printf("    Move to absolute rotary joint angles in degrees and claw gap in cm.\n");
+    printf("    A successful pos enters Pos mode; jerr is ignored until stop.\n");
+    printf("  stop       stop current motion and return to default Track mode\n");
+    printf("  state      print PWM state, references, targets and watchdog state\n");
+    printf("  fk         print forward pose from reference positions\n");
+    printf("  enable 0   when disabled, enable at calibration zero with claw closed\n");
+    printf("  disable    immediately disable PWM outputs\n");
+    printf("  help       print this help\n\n");
+    printf("Startup application mode: Track. No mode-selection command is needed.\n\n");
+    printf("Example position override:\n");
+    printf("  pos 0 -25 45 15 0 0\n\n");
+    printf("Fixed task-speed limits: F=%.1f L=%.1f U=%.1f mm/s, P=%.1f deg/s.\n",
+           static_cast<double>(kVisualVelocity.max_forward_mm_per_s),
+           static_cast<double>(kVisualVelocity.max_left_mm_per_s),
+           static_cast<double>(kVisualVelocity.max_up_mm_per_s),
+           static_cast<double>(kVisualVelocity.max_pitch_deg_per_s));
 }
 
 static void print_state()
 {
     const ArmMotionState s = g_motion.get_state();
+    const char* error_joint = s.driver_error_joint_valid
+        ? joint_name(s.driver_error_joint)
+        : "none";
+    printf("initialized=%d app=%s pwm=%s mode=%s reference_moving=%d fresh=%d timeout=%d age=%lums claw_ref=%.2f claw_target=%.2f driver_error=0x%x error_joint=%s\n",
+           s.initialized,
+           app_control_mode_name(g_app_control_mode),
+           output_state_name(s.output_state),
+           mode_name(s.mode),
+           s.reference_moving,
+           s.command_fresh,
+           s.command_timed_out,
+           static_cast<unsigned long>(s.command_age_ms),
+           static_cast<double>(s.claw_reference_gap_cm),
+           static_cast<double>(s.claw_target_gap_cm),
+           static_cast<unsigned>(s.last_driver_error),
+           error_joint);
 
-    printf("\n");
-    printf("Arm motion state:\n");
-    printf("  initialized:        %d\n", static_cast<int>(s.initialized));
-    printf("  ready:              %d\n", static_cast<int>(s.ready));
-    printf("  moving:             %d\n", static_cast<int>(s.moving));
-    printf("  claw_gap_cm:        %.2f\n", static_cast<double>(s.claw_gap_cm));
-    printf("  claw_target_gap_cm: %.2f\n", static_cast<double>(s.claw_target_gap_cm));
-    printf("\n");
+    auto print_joint = [](const char* name, const learm::ArmMotionReferenceState& joint) {
+        printf("  %-12s q_ref=%8.3f  q_target=%8.3f  v_target=%8.3f  v_applied=%8.3f ref_reached=%d limit=%d\n",
+               name,
+               static_cast<double>(joint.reference_deg),
+               static_cast<double>(joint.target_position_deg),
+               static_cast<double>(joint.target_velocity_deg_per_s),
+               static_cast<double>(joint.applied_velocity_deg_per_s),
+               joint.reference_reached,
+               joint.limit_blocked);
+    };
 
-    print_joint_state("Base", s.base);
-    print_joint_state("Shoulder", s.shoulder);
-    print_joint_state("Elbow", s.elbow);
-    print_joint_state("WristPitch", s.wrist_pitch);
-    print_joint_state("WristRoll", s.wrist_roll);
-    print_joint_state("Claw", s.claw);
-    printf("\n");
+    print_joint("base", s.base);
+    print_joint("shoulder", s.shoulder);
+    print_joint("elbow", s.elbow);
+    print_joint("wrist_pitch", s.wrist_pitch);
+    print_joint("wrist_roll", s.wrist_roll);
 }
 
-static bool parse_six_u32(char* args, uint32_t out[6])
+static void print_fk()
 {
-    if (args == nullptr || out == nullptr) {
-        return false;
+    const ArmMotionState motion_state = g_motion.get_state();
+    const ArmKinematicsJointState joints =
+        kinematics_state_from_motion(motion_state);
+
+    ArmCartesianPose pose;
+    const esp_err_t ret = g_kinematics.forward_pose(joints, &pose);
+    if (ret != ESP_OK) {
+        printf("forward_pose ret=0x%x\n", static_cast<unsigned>(ret));
+        return;
     }
 
-    for (int i = 0; i < 6; ++i) {
-        char* token = strtok(i == 0 ? args : nullptr, " \t");
-        if (token == nullptr) {
-            return false;
-        }
-
-        char* end = nullptr;
-        const unsigned long value = strtoul(token, &end, 10);
-
-        if (end == token || *end != '\0' || value == 0 || value > UINT32_MAX) {
-            return false;
-        }
-
-        out[i] = static_cast<uint32_t>(value);
-    }
-
-    return strtok(nullptr, " \t") == nullptr;
-}
-
-static bool parse_six_float(char* args, float out[6])
-{
-    if (args == nullptr || out == nullptr) {
-        return false;
-    }
-
-    for (int i = 0; i < 6; ++i) {
-        char* token = strtok(i == 0 ? args : nullptr, " \t");
-        if (token == nullptr) {
-            return false;
-        }
-
-        char* end = nullptr;
-        const float value = strtof(token, &end);
-
-        if (end == token || *end != '\0') {
-            return false;
-        }
-
-        out[i] = value;
-    }
-
-    return strtok(nullptr, " \t") == nullptr;
-}
-
-static bool parse_three_float(char* args, float out[3])
-{
-    if (args == nullptr || out == nullptr) {
-        return false;
-    }
-
-    for (int i = 0; i < 3; ++i) {
-        char* token = strtok(i == 0 ? args : nullptr, " \t");
-        if (token == nullptr) {
-            return false;
-        }
-
-        char* end = nullptr;
-        const float value = strtof(token, &end);
-
-        if (end == token || *end != '\0') {
-            return false;
-        }
-
-        out[i] = value;
-    }
-
-    return strtok(nullptr, " \t") == nullptr;
-}
-
-static bool parse_six_styles(char* args, JointMotionStyle out[6])
-{
-    if (args == nullptr || out == nullptr) {
-        return false;
-    }
-
-    for (int i = 0; i < 6; ++i) {
-        char* token = strtok(i == 0 ? args : nullptr, " \t");
-        if (token == nullptr) {
-            return false;
-        }
-
-        if (!parse_style_token(token, &out[i])) {
-            return false;
-        }
-    }
-
-    return strtok(nullptr, " \t") == nullptr;
-}
-
-static void run_demo_sequence()
-{
-    printf("\n");
-    printf("Running arm_motion demo sequence...\n");
-    printf("\n");
-
-    ESP_ERROR_CHECK(g_motion.set_durations_ms(
-        900,
-        1100,
-        1100,
-        800,
-        600,
-        500
-    ));
-
-    ESP_ERROR_CHECK(g_motion.set_strategies(
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Soft,
-        JointMotionStyle::Soft,
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth
-    ));
-
-    printf("Demo step 1: ready-ish pose, claw open.\n");
-    ESP_ERROR_CHECK(g_motion.move_to(
-        0.0f,
-        -25.0f,
-        35.0f,
-        45.0f,
-        0.0f,
-        5.8f
-    ));
-
-    delay_ms(1600);
-    print_state();
-
-    printf("Demo step 2: another pose, claw gap 3.0cm.\n");
-    ESP_ERROR_CHECK(g_motion.set_durations_ms(
-        800,
-        1000,
-        1000,
-        700,
-        500,
-        500
-    ));
-
-    ESP_ERROR_CHECK(g_motion.move_to(
-        25.0f,
-        -15.0f,
-        50.0f,
-        55.0f,
-        20.0f,
-        3.0f
-    ));
-
-    delay_ms(1500);
-    print_state();
-
-    printf("Demo step 3: back to zero/open.\n");
-    ESP_ERROR_CHECK(g_motion.set_strategies(
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth,
-        JointMotionStyle::Smooth
-    ));
-
-    ESP_ERROR_CHECK(g_motion.move_to(
-        0.0f,
-        0.0f,
-        0.0f,
-        0.0f,
-        0.0f,
-        5.8f
-    ));
-
-    delay_ms(1500);
-    print_state();
-
-    printf("Demo finished.\n\n");
+    printf("pose x=%.2f y=%.2f z=%.2f pitch=%.2f roll=%.2f\n",
+           static_cast<double>(pose.x_mm),
+           static_cast<double>(pose.y_mm),
+           static_cast<double>(pose.z_mm),
+           static_cast<double>(pose.tool_pitch_deg),
+           static_cast<double>(pose.tool_roll_deg));
 }
 
 static void process_command(char* line)
 {
     trim_line(line);
-
     if (line[0] == '\0') {
         return;
     }
 
-    if (strcmp(line, "help") == 0 ||
-        strcmp(line, "h") == 0 ||
-        strcmp(line, "?") == 0) {
+    if (strcmp(line, "help") == 0) {
         print_help();
         return;
     }
-
-    if (strcmp(line, "enable") == 0) {
-        ESP_LOGW(TAG, "Batch enable all joints via arm_motion.enable_all()");
-        const esp_err_t ret = g_motion.enable_all();
-        printf("enable_all ret=0x%x\n", static_cast<unsigned>(ret));
+    if (strcmp(line, "state") == 0) {
         print_state();
         return;
     }
-
-    if (strcmp(line, "disable") == 0 ||
-        strcmp(line, "detach") == 0) {
-        ESP_LOGW(TAG, "Disable all joints via arm_motion.disable_all()");
-        const esp_err_t ret = g_motion.disable_all();
-        printf("disable_all ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
+    if (strcmp(line, "fk") == 0) {
+        print_fk();
         return;
     }
-
-    if (strcmp(line, "default") == 0) {
-        print_default_enable_pulses();
-        return;
-    }
-
-    if (strcmp(line, "config") == 0) {
-        print_config();
-        return;
-    }
-
-    if (strcmp(line, "state") == 0 ||
-        strcmp(line, "s") == 0) {
-        print_state();
-        return;
-    }
-
-    if (strcmp(line, "ready") == 0) {
-        printf(
-            "ready=%d moving=%d\n",
-            static_cast<int>(g_motion.is_ready()),
-            static_cast<int>(g_motion.is_moving())
-        );
-        return;
-    }
-
     if (strcmp(line, "stop") == 0) {
-        ESP_LOGW(TAG, "Stop motion and hold current commanded pose via arm_motion.stop_all()");
-        const esp_err_t ret = g_motion.stop_all();
-        printf("stop_all ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
+        const esp_err_t ret = g_motion.stop();
+        enter_track_mode();
+        printf("stop ret=0x%x app=%s\n",
+               static_cast<unsigned>(ret),
+               app_control_mode_name(g_app_control_mode));
         return;
     }
-
-    if (starts_with(line, "dur ")) {
-        uint32_t values[6] = {};
-        char* args = line + strlen("dur ");
-
-        if (!parse_six_u32(args, values)) {
-            printf("Invalid durations. Usage: dur 1000 1200 1200 800 600 500\n");
-            return;
+    if (strcmp(line, "enable 0") == 0) {
+        const esp_err_t ret = g_motion.enable_all_at_zero_closed();
+        if (ret == ESP_OK) {
+            enter_track_mode();
         }
-
-        const esp_err_t ret = g_motion.set_durations_ms(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("set_durations_ms ret=0x%x\n", static_cast<unsigned>(ret));
-        print_config();
-        return;
-    }
-
-    if (starts_with(line, "duration ")) {
-        uint32_t values[6] = {};
-        char* args = line + strlen("duration ");
-
-        if (!parse_six_u32(args, values)) {
-            printf("Invalid durations. Usage: duration 1000 1200 1200 800 600 500\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.set_durations_ms(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("set_durations_ms ret=0x%x\n", static_cast<unsigned>(ret));
-        print_config();
-        return;
-    }
-
-    if (starts_with(line, "style ")) {
-        JointMotionStyle values[6] = {};
-        char* args = line + strlen("style ");
-
-        if (!parse_six_styles(args, values)) {
-            printf("Invalid styles. Use linear/smooth/soft or 0/1/2.\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.set_strategies(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("set_strategies ret=0x%x\n", static_cast<unsigned>(ret));
-        print_config();
-        return;
-    }
-
-    if (starts_with(line, "styles ")) {
-        JointMotionStyle values[6] = {};
-        char* args = line + strlen("styles ");
-
-        if (!parse_six_styles(args, values)) {
-            printf("Invalid styles. Use linear/smooth/soft or 0/1/2.\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.set_strategies(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("set_strategies ret=0x%x\n", static_cast<unsigned>(ret));
-        print_config();
-        return;
-    }
-
-    if (starts_with(line, "speed ")) {
-        float values[6] = {};
-        char* args = line + strlen("speed ");
-
-        if (!parse_six_float(args, values)) {
-            printf("Invalid speeds. Usage: speed 45 35 35 50 70 2.5\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.set_speed_limits(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("set_speed_limits ret=0x%x\n", static_cast<unsigned>(ret));
-        print_config();
-        return;
-    }
-
-    if (starts_with(line, "movenow ")) {
-        float values[6] = {};
-        char* args = line + strlen("movenow ");
-
-        if (!parse_six_float(args, values)) {
-            printf("Invalid immediate move target. Usage: movenow 0 -30 45 60 0 5.8\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.move_to_immediate(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("move_to_immediate ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
-        return;
-    }
-
-    if (starts_with(line, "deltanow ")) {
-        float values[6] = {};
-        char* args = line + strlen("deltanow ");
-
-        if (!parse_six_float(args, values)) {
-            printf("Invalid delta-immediate command. Usage: deltanow 1 0 0 0 0 0\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.move_delta_immediate(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("move_delta_immediate ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
-        return;
-    }
-
-    if (starts_with(line, "jtool ") || starts_with(line, "jcam ")) {
-        float values[4] = {};
-        char* args = starts_with(line, "jtool ")
-            ? line + strlen("jtool ")
-            : line + strlen("jcam ");
-
-        const int parsed = sscanf(
-            args,
-            "%f %f %f %f",
-            &values[0],
-            &values[1],
-            &values[2],
-            &values[3]
-        );
-        if (parsed < 3) {
-            printf("Invalid tool target error. Usage: jtool F L U [desired_forward]\n");
-            return;
-        }
-
-        const ArmKinematicsJointState joints = current_kinematics_joints();
-
-        ArmToolTargetError error;
-        error.forward_mm = values[0];
-        error.left_mm = values[1];
-        error.up_mm = values[2];
-        error.desired_forward_mm = (parsed >= 4) ? values[3] : 0.0f;
-
-        ArmKinematicsDelta delta;
-        const esp_err_t solve_ret = g_kinematics.solve_tool_target_delta(
-            joints,
-            error,
-            &delta
-        );
-
-        printf("solve_tool_target_delta ret=0x%x\n", static_cast<unsigned>(solve_ret));
-        if (solve_ret != ESP_OK) {
-            return;
-        }
-
         printf(
-            "tool delta deg: base=%+.3f shoulder=%+.3f elbow=%+.3f wrist_pitch=%+.3f wrist_roll=%+.3f\n",
-            static_cast<double>(delta.base_delta_deg),
-            static_cast<double>(delta.shoulder_delta_deg),
-            static_cast<double>(delta.elbow_delta_deg),
-            static_cast<double>(delta.wrist_pitch_delta_deg),
-            static_cast<double>(delta.wrist_roll_delta_deg)
+            "enable 0 ret=0x%x app=%s\n",
+            static_cast<unsigned>(ret),
+            app_control_mode_name(g_app_control_mode)
         );
-
-        const esp_err_t move_ret = g_motion.move_delta_immediate(
-            delta.base_delta_deg,
-            delta.shoulder_delta_deg,
-            delta.elbow_delta_deg,
-            delta.wrist_pitch_delta_deg,
-            delta.wrist_roll_delta_deg,
-            0.0f
-        );
-
-        printf("move_delta_immediate ret=0x%x\n", static_cast<unsigned>(move_ret));
-        print_state();
+        return;
+    }
+    if (strcmp(line, "disable") == 0) {
+        const esp_err_t ret = g_motion.disable_all();
+        enter_track_mode();
+        printf("disable ret=0x%x app=%s\n",
+               static_cast<unsigned>(ret),
+               app_control_mode_name(g_app_control_mode));
         return;
     }
 
-    if (starts_with(line, "movespeed ")) {
-        float values[6] = {};
-        char* args = line + strlen("movespeed ");
+    ArmMotionPositionCommand position_command;
+    if (parse_position_command(line, &position_command)) {
+        const esp_err_t ret = g_motion.move_to(position_command);
+        if (ret == ESP_OK) {
+            enter_pos_mode();
+        }
+        printf("pos ret=0x%x app=%s\n",
+               static_cast<unsigned>(ret),
+               app_control_mode_name(g_app_control_mode));
+        return;
+    }
+    if (has_command_prefix(line, "pos")) {
+        printf("invalid pos; expected: pos B S E WP WR GAP\n");
+        return;
+    }
 
-        if (!parse_six_float(args, values)) {
-            printf("Invalid speed move target. Usage: movespeed 0 -30 45 60 0 5.8\n");
+    float forward_error = 0.0f;
+    float left_error = 0.0f;
+    float up_error = 0.0f;
+    float pitch_error = 0.0f;
+    if (parse_normalized_error_command(
+            line,
+            &forward_error,
+            &left_error,
+            &up_error,
+            &pitch_error)) {
+        if (g_app_control_mode != AppControlMode::Track) {
+            if (!g_jerr_ignore_reported) {
+                printf("jerr ignored: app=pos; send stop to resume tracking\n");
+                g_jerr_ignore_reported = true;
+            }
             return;
         }
 
-        const esp_err_t ret = g_motion.move_to_speed(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
+        const esp_err_t ret = apply_normalized_error(
+            forward_error,
+            left_error,
+            up_error,
+            pitch_error
         );
-
-        printf("move_to_speed ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
-        return;
-    }
-
-    if (starts_with(line, "movev ")) {
-        float values[6] = {};
-        char* args = line + strlen("movev ");
-
-        if (!parse_six_float(args, values)) {
-            printf("Invalid speed move target. Usage: movev 0 -30 45 60 0 5.8\n");
-            return;
+        if (ret != ESP_OK) {
+            printf("jerr failed ret=0x%x; app=%s\n",
+                   static_cast<unsigned>(ret),
+                   app_control_mode_name(g_app_control_mode));
         }
-
-        const esp_err_t ret = g_motion.move_to_speed(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("move_to_speed ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
+        return;
+    }
+    if (has_command_prefix(line, "jerr")) {
+        printf("invalid jerr; expected: jerr F L U P\n");
         return;
     }
 
-    if (starts_with(line, "move ")) {
-        float values[6] = {};
-        char* args = line + strlen("move ");
-
-        if (!parse_six_float(args, values)) {
-            printf("Invalid move target. Usage: move 0 -30 45 60 0 5.8\n");
-            return;
-        }
-
-        const esp_err_t ret = g_motion.move_to(
-            values[0],
-            values[1],
-            values[2],
-            values[3],
-            values[4],
-            values[5]
-        );
-
-        printf("move_to ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
-        return;
-    }
-
-    if (strcmp(line, "zero") == 0 ||
-        strcmp(line, "home") == 0) {
-        const esp_err_t ret = g_motion.move_to(
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            5.8f
-        );
-
-        printf("move_to zero/open ret=0x%x\n", static_cast<unsigned>(ret));
-        print_state();
-        return;
-    }
-
-    if (strcmp(line, "demo") == 0) {
-        run_demo_sequence();
-        return;
-    }
-
-    printf("Unknown command: %s\n", line);
-    printf("Type 'help' for commands.\n");
+    printf("unknown command; type help\n");
 }
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "arm_motion V5A motion-owned test starting");
+    ESP_LOGI(TAG, "starting normalized-error position + streaming-velocity experiment");
 
-    ESP_ERROR_CHECK(
-        g_servo.init(
-            learm::arm_joint_defaults::kServoPwmConfigs,
-            learm::arm_joint_defaults::kServoPwmConfigCount
-        )
-    );
+    ESP_ERROR_CHECK(g_servo.init(
+        learm::arm_joint_defaults::kServoPwmConfigs,
+        learm::arm_joint_defaults::kServoPwmConfigCount
+    ));
 
-    ESP_ERROR_CHECK(
-        g_joints.init(
-            &g_servo,
-            learm::arm_joint_defaults::kJointCalibrations,
-            learm::arm_joint_defaults::kJointCalibrationCount
-        )
-    );
+    ESP_ERROR_CHECK(g_joints.init(
+        &g_servo,
+        learm::arm_joint_defaults::kJointCalibrations,
+        learm::arm_joint_defaults::kJointCalibrationCount
+    ));
 
     ESP_ERROR_CHECK(g_motion.init(&g_joints));
-    ESP_ERROR_CHECK(g_kinematics.init(make_default_kinematics_config()));
+    ESP_ERROR_CHECK(g_kinematics.init());
 
-    ESP_LOGW(TAG, "SAFE MODE: servo_pwm initialized, joints still disabled");
+    ESP_LOGW(TAG, "servo outputs remain disabled for 3 seconds");
     delay_ms(3000);
-
-    ESP_LOGW(TAG, "Batch enable all joints through g_motion.enable_all()");
-    ESP_ERROR_CHECK(g_motion.enable_all());
-
-    delay_ms(1000);
+    ESP_ERROR_CHECK(g_motion.enable_all_at(kInitialPose));
+    enter_track_mode();
 
     print_help();
-    print_default_enable_pulses();
-    print_config();
     print_state();
 
     char line[160];
-
-    printf("arm_motion_v5a> ");
-    fflush(stdout);
-
     while (true) {
         if (fgets(line, sizeof(line), stdin) == nullptr) {
-            delay_ms(100);
+            delay_ms(20);
             continue;
         }
-
         process_command(line);
-
-        printf("arm_motion_v5a> ");
-        fflush(stdout);
     }
 }

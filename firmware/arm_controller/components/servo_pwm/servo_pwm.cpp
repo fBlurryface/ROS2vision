@@ -95,7 +95,7 @@ esp_err_t ServoPwm::setup_pwm_backend()
                 static_cast<unsigned>(i),
                 esp_err_to_name(ret)
             );
-            teardown_pwm_backend();
+            (void)teardown_pwm_backend();
             return ret;
         }
 
@@ -107,7 +107,7 @@ esp_err_t ServoPwm::setup_pwm_backend()
                 static_cast<unsigned>(i),
                 esp_err_to_name(ret)
             );
-            teardown_pwm_backend();
+            (void)teardown_pwm_backend();
             return ret;
         }
     }
@@ -119,14 +119,14 @@ esp_err_t ServoPwm::setup_pwm_backend()
     ret = mcpwm_timer_enable(mcpwm_timer_);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "mcpwm_timer_enable failed: %s", esp_err_to_name(ret));
-        teardown_pwm_backend();
+        (void)teardown_pwm_backend();
         return ret;
     }
 
     ret = mcpwm_timer_start_stop(mcpwm_timer_, MCPWM_TIMER_START_NO_STOP);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "mcpwm_timer_start_stop failed: %s", esp_err_to_name(ret));
-        teardown_pwm_backend();
+        (void)teardown_pwm_backend();
         return ret;
     }
 
@@ -136,39 +136,65 @@ esp_err_t ServoPwm::setup_pwm_backend()
     return ESP_OK;
 }
 
-void ServoPwm::teardown_pwm_backend()
+esp_err_t ServoPwm::teardown_pwm_backend()
 {
+    esp_err_t first_error = ESP_OK;
+
     if (mcpwm_timer_ != nullptr) {
-        // Best effort: stop the timer before deleting downstream resources.
-        (void)mcpwm_timer_start_stop(mcpwm_timer_, MCPWM_TIMER_STOP_EMPTY);
+        const esp_err_t ret =
+            mcpwm_timer_start_stop(mcpwm_timer_, MCPWM_TIMER_STOP_EMPTY);
+        if (ret != ESP_OK) {
+            first_error = ret;
+        }
     }
 
     for (uint8_t i = 0; i < kServoCount; ++i) {
-        destroy_channel_resources(i);
+        const esp_err_t ret = destroy_channel_resources(i);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
     }
 
     for (uint8_t i = 0; i < kMcpwmOperatorCount; ++i) {
         if (mcpwm_operators_[i] != nullptr) {
-            (void)mcpwm_del_operator(mcpwm_operators_[i]);
-            mcpwm_operators_[i] = nullptr;
+            const esp_err_t ret = mcpwm_del_operator(mcpwm_operators_[i]);
+            if (ret == ESP_OK) {
+                mcpwm_operators_[i] = nullptr;
+            } else if (first_error == ESP_OK) {
+                first_error = ret;
+            }
         }
     }
 
     if (mcpwm_timer_ != nullptr) {
-        (void)mcpwm_timer_disable(mcpwm_timer_);
-        (void)mcpwm_del_timer(mcpwm_timer_);
-        mcpwm_timer_ = nullptr;
+        esp_err_t ret = mcpwm_timer_disable(mcpwm_timer_);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+
+        ret = mcpwm_del_timer(mcpwm_timer_);
+        if (ret == ESP_OK) {
+            mcpwm_timer_ = nullptr;
+        } else if (first_error == ESP_OK) {
+            first_error = ret;
+        }
     }
+
+    return first_error;
 }
 
-esp_err_t ServoPwm::create_channel_resources(uint8_t index)
+esp_err_t ServoPwm::create_channel_resources(
+    uint8_t index,
+    uint16_t initial_output_us
+)
 {
     if (index >= kServoCount || !states_[index].configured) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (mcpwm_comparators_[index] != nullptr || mcpwm_generators_[index] != nullptr) {
-        return ESP_OK;
+    if (mcpwm_comparators_[index] != nullptr ||
+        mcpwm_generators_[index] != nullptr) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     const uint8_t op_index = channel_to_operator_index(index);
@@ -212,13 +238,18 @@ esp_err_t ServoPwm::create_channel_resources(uint8_t index)
             static_cast<int>(cfg.gpio),
             esp_err_to_name(ret)
         );
-        destroy_channel_resources(index);
+        const esp_err_t cleanup_ret = destroy_channel_resources(index);
+        if (cleanup_ret != ESP_OK) {
+            ESP_LOGE(TAG, "channel cleanup failed S%u: %s",
+                     static_cast<unsigned>(index),
+                     esp_err_to_name(cleanup_ret));
+        }
         return ret;
     }
 
     ret = mcpwm_comparator_set_compare_value(
         mcpwm_comparators_[index],
-        states_[index].output_us
+        initial_output_us
     );
     if (ret != ESP_OK) {
         ESP_LOGE(
@@ -227,7 +258,12 @@ esp_err_t ServoPwm::create_channel_resources(uint8_t index)
             static_cast<unsigned>(index),
             esp_err_to_name(ret)
         );
-        destroy_channel_resources(index);
+        const esp_err_t cleanup_ret = destroy_channel_resources(index);
+        if (cleanup_ret != ESP_OK) {
+            ESP_LOGE(TAG, "channel cleanup failed S%u: %s",
+                     static_cast<unsigned>(index),
+                     esp_err_to_name(cleanup_ret));
+        }
         return ret;
     }
 
@@ -246,7 +282,12 @@ esp_err_t ServoPwm::create_channel_resources(uint8_t index)
             static_cast<unsigned>(index),
             esp_err_to_name(ret)
         );
-        destroy_channel_resources(index);
+        const esp_err_t cleanup_ret = destroy_channel_resources(index);
+        if (cleanup_ret != ESP_OK) {
+            ESP_LOGE(TAG, "channel cleanup failed S%u: %s",
+                     static_cast<unsigned>(index),
+                     esp_err_to_name(cleanup_ret));
+        }
         return ret;
     }
 
@@ -265,7 +306,12 @@ esp_err_t ServoPwm::create_channel_resources(uint8_t index)
             static_cast<unsigned>(index),
             esp_err_to_name(ret)
         );
-        destroy_channel_resources(index);
+        const esp_err_t cleanup_ret = destroy_channel_resources(index);
+        if (cleanup_ret != ESP_OK) {
+            ESP_LOGE(TAG, "channel cleanup failed S%u: %s",
+                     static_cast<unsigned>(index),
+                     esp_err_to_name(cleanup_ret));
+        }
         return ret;
     }
 
@@ -278,52 +324,46 @@ esp_err_t ServoPwm::create_channel_resources(uint8_t index)
         static_cast<unsigned>(index),
         static_cast<int>(cfg.gpio),
         static_cast<unsigned>(op_index),
-        states_[index].output_us
+        initial_output_us
     );
 
     return ESP_OK;
 }
 
-void ServoPwm::destroy_channel_resources(uint8_t index)
+esp_err_t ServoPwm::destroy_channel_resources(uint8_t index)
 {
     if (index >= kServoCount) {
-        return;
-    }
-
-    if (mcpwm_generators_[index] != nullptr) {
-        (void)mcpwm_generator_set_force_level(mcpwm_generators_[index], 0, true);
-        (void)mcpwm_del_generator(mcpwm_generators_[index]);
-        mcpwm_generators_[index] = nullptr;
-    }
-
-    if (mcpwm_comparators_[index] != nullptr) {
-        (void)mcpwm_del_comparator(mcpwm_comparators_[index]);
-        mcpwm_comparators_[index] = nullptr;
-    }
-}
-
-esp_err_t ServoPwm::configure_channel(uint8_t index, uint16_t output_us)
-{
-    if (index >= kServoCount || !states_[index].configured) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (mcpwm_comparators_[index] == nullptr || mcpwm_generators_[index] == nullptr) {
-        return ESP_ERR_INVALID_STATE;
+    esp_err_t first_error = ESP_OK;
+
+    if (mcpwm_generators_[index] != nullptr) {
+        esp_err_t ret =
+            mcpwm_generator_set_force_level(mcpwm_generators_[index], 0, true);
+        if (ret != ESP_OK) {
+            first_error = ret;
+        }
+
+        ret = mcpwm_del_generator(mcpwm_generators_[index]);
+        if (ret == ESP_OK) {
+            mcpwm_generators_[index] = nullptr;
+        } else if (first_error == ESP_OK) {
+            first_error = ret;
+        }
     }
 
-    const ServoPwmConfig& cfg = states_[index].config;
+    if (mcpwm_comparators_[index] != nullptr) {
+        const esp_err_t ret =
+            mcpwm_del_comparator(mcpwm_comparators_[index]);
+        if (ret == ESP_OK) {
+            mcpwm_comparators_[index] = nullptr;
+        } else if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+    }
 
-    output_us = std::clamp<uint16_t>(
-        output_us,
-        cfg.min_us,
-        cfg.max_us
-    );
-
-    return mcpwm_comparator_set_compare_value(
-        mcpwm_comparators_[index],
-        output_us
-    );
+    return first_error;
 }
 
 esp_err_t ServoPwm::write_output_us(uint8_t index, uint16_t output_us)
@@ -332,7 +372,9 @@ esp_err_t ServoPwm::write_output_us(uint8_t index, uint16_t output_us)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!states_[index].enabled) {
+    if (!states_[index].enabled ||
+        mcpwm_comparators_[index] == nullptr ||
+        mcpwm_generators_[index] == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -410,8 +452,7 @@ esp_err_t ServoPwm::init(const ServoPwmConfig* configs, uint8_t count)
         s.enabled = false;
         s.config = cfg;
 
-        s.current_us = cfg.reset_us;
-        s.target_us = cfg.reset_us;
+        s.command_us = cfg.reset_us;
         s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), cfg.reset_us);
 
         ESP_LOGI(
@@ -453,18 +494,25 @@ esp_err_t ServoPwm::deinit()
         if (!guard.locked()) {
             ret = ESP_ERR_TIMEOUT;
         } else {
-            ret = disable_all();
-            initialized_ = false;
-            teardown_pwm_backend();
+            const esp_err_t disable_ret = disable_all();
+            const esp_err_t teardown_ret = teardown_pwm_backend();
+            ret = disable_ret != ESP_OK ? disable_ret : teardown_ret;
+            if (ret == ESP_OK) {
+                initialized_ = false;
+            }
         }
     }
 
-    if (lock_ != nullptr) {
+    if (!initialized_ && lock_ != nullptr) {
         vSemaphoreDelete(lock_);
         lock_ = nullptr;
     }
 
-    ESP_LOGI(TAG, "servo_pwm deinitialized");
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "servo_pwm deinitialized");
+    } else {
+        ESP_LOGE(TAG, "servo_pwm deinit incomplete: %s", esp_err_to_name(ret));
+    }
 
     return ret;
 }
@@ -487,27 +535,26 @@ esp_err_t ServoPwm::enable(ServoChannel channel, uint16_t start_us)
 
     ServoState& s = states_[index];
 
-    start_us = clamp_command_us(static_cast<uint8_t>(index), start_us);
-
-    s.current_us = start_us;
-    s.target_us = start_us;
-    s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), start_us);
-
-    esp_err_t ret = create_channel_resources(static_cast<uint8_t>(index));
-    if (ret != ESP_OK) {
-        return ret;
+    if (s.enabled || mcpwm_comparators_[index] != nullptr ||
+        mcpwm_generators_[index] != nullptr) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    ret = configure_channel(
+    const uint16_t command_us =
+        clamp_command_us(static_cast<uint8_t>(index), start_us);
+    const uint16_t output_us =
+        apply_offset_and_clamp(static_cast<uint8_t>(index), command_us);
+
+    const esp_err_t ret = create_channel_resources(
         static_cast<uint8_t>(index),
-        s.output_us
+        output_us
     );
-
     if (ret != ESP_OK) {
-        destroy_channel_resources(static_cast<uint8_t>(index));
         return ret;
     }
 
+    s.command_us = command_us;
+    s.output_us = output_us;
     s.enabled = true;
 
     ESP_LOGW(
@@ -515,7 +562,7 @@ esp_err_t ServoPwm::enable(ServoChannel channel, uint16_t start_us)
         "enabled S%u gpio=%d command=%uus output=%uus",
         static_cast<unsigned>(index),
         static_cast<int>(s.config.gpio),
-        s.current_us,
+        s.command_us,
         s.output_us
     );
 
@@ -543,7 +590,16 @@ esp_err_t ServoPwm::disable(ServoChannel channel)
     // Disable must mean "no valid RC-servo pulse on the signal wire".
     // Never encode disable as an ultra-short pulse: some servos interpret that
     // as an extreme position command and can slam into mechanical limits.
-    destroy_channel_resources(static_cast<uint8_t>(index));
+    esp_err_t first_error =
+        destroy_channel_resources(static_cast<uint8_t>(index));
+    if (first_error != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "MCPWM cleanup failed while disabling S%u: %s",
+            static_cast<unsigned>(index),
+            esp_err_to_name(first_error)
+        );
+    }
 
     const gpio_num_t gpio = s.config.gpio;
     esp_err_t ret = gpio_reset_pin(gpio);
@@ -555,7 +611,9 @@ esp_err_t ServoPwm::disable(ServoChannel channel)
             static_cast<int>(gpio),
             esp_err_to_name(ret)
         );
-        return ret;
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
     }
 
     // Preload the output latch low before switching the pin back to GPIO
@@ -569,7 +627,9 @@ esp_err_t ServoPwm::disable(ServoChannel channel)
             static_cast<int>(gpio),
             esp_err_to_name(ret)
         );
-        return ret;
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
     }
 
     ret = gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
@@ -581,7 +641,13 @@ esp_err_t ServoPwm::disable(ServoChannel channel)
             static_cast<int>(gpio),
             esp_err_to_name(ret)
         );
-        return ret;
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+    }
+
+    if (first_error != ESP_OK) {
+        return first_error;
     }
 
     s.enabled = false;
@@ -605,18 +671,20 @@ esp_err_t ServoPwm::disable_all()
         return ESP_ERR_TIMEOUT;
     }
 
+    esp_err_t first_error = ESP_OK;
+
     for (uint8_t i = 0; i < kServoCount; ++i) {
         if (!states_[i].configured) {
             continue;
         }
 
-        esp_err_t ret = disable(static_cast<ServoChannel>(i));
-        if (ret != ESP_OK) {
-            return ret;
+        const esp_err_t ret = disable(static_cast<ServoChannel>(i));
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
         }
     }
 
-    return ESP_OK;
+    return first_error;
 }
 
 bool ServoPwm::is_enabled(ServoChannel channel) const
@@ -657,13 +725,20 @@ esp_err_t ServoPwm::write_us_now(ServoChannel channel, uint16_t pulse_us)
         return ESP_ERR_INVALID_STATE;
     }
 
-    pulse_us = clamp_command_us(static_cast<uint8_t>(index), pulse_us);
+    const uint16_t command_us =
+        clamp_command_us(static_cast<uint8_t>(index), pulse_us);
+    const uint16_t output_us =
+        apply_offset_and_clamp(static_cast<uint8_t>(index), command_us);
 
-    s.current_us = pulse_us;
-    s.target_us = pulse_us;
-    s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), pulse_us);
+    const esp_err_t ret =
+        write_output_us(static_cast<uint8_t>(index), output_us);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
-    return write_output_us(static_cast<uint8_t>(index), s.output_us);
+    s.command_us = command_us;
+    s.output_us = output_us;
+    return ESP_OK;
 }
 
 esp_err_t ServoPwm::set_config(ServoChannel channel, const ServoPwmConfig& config)
@@ -687,7 +762,11 @@ esp_err_t ServoPwm::set_config(ServoChannel channel, const ServoPwmConfig& confi
         (mcpwm_generators_[index] != nullptr || mcpwm_comparators_[index] != nullptr);
 
     if (need_recreate) {
-        destroy_channel_resources(static_cast<uint8_t>(index));
+        const esp_err_t ret =
+            destroy_channel_resources(static_cast<uint8_t>(index));
+        if (ret != ESP_OK) {
+            return ret;
+        }
     }
 
     ServoPwmConfig cfg = config;
@@ -712,8 +791,7 @@ esp_err_t ServoPwm::set_config(ServoChannel channel, const ServoPwmConfig& confi
     s.enabled = false;
     s.config = cfg;
 
-    s.current_us = cfg.reset_us;
-    s.target_us = cfg.reset_us;
+    s.command_us = cfg.reset_us;
     s.output_us = apply_offset_and_clamp(static_cast<uint8_t>(index), cfg.reset_us);
 
     // Keep configured-but-disabled channels silent.  MCPWM resources are
@@ -750,17 +828,29 @@ esp_err_t ServoPwm::set_offset(ServoChannel channel, int16_t offset_us)
 
     ServoState& s = states_[index];
 
-    s.config.offset_us = offset_us;
-    s.output_us = apply_offset_and_clamp(
-        static_cast<uint8_t>(index),
-        s.current_us
-    );
+    const int unclamped_output =
+        static_cast<int>(s.command_us) + static_cast<int>(offset_us);
+    const uint16_t output_us = static_cast<uint16_t>(std::clamp<int>(
+        unclamped_output,
+        s.config.min_us,
+        s.config.max_us
+    ));
 
     if (!s.enabled) {
+        s.config.offset_us = offset_us;
+        s.output_us = output_us;
         return ESP_OK;
     }
 
-    return write_output_us(static_cast<uint8_t>(index), s.output_us);
+    const esp_err_t ret =
+        write_output_us(static_cast<uint8_t>(index), output_us);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    s.config.offset_us = offset_us;
+    s.output_us = output_us;
+    return ESP_OK;
 }
 
 int16_t ServoPwm::get_offset(ServoChannel channel) const
@@ -790,22 +880,7 @@ uint16_t ServoPwm::read_command_us(ServoChannel channel) const
         return 0;
     }
 
-    return states_[index].current_us;
-}
-
-uint16_t ServoPwm::read_target_us(ServoChannel channel) const
-{
-    const LockGuard guard(this);
-    if (!guard.locked()) {
-        return 0;
-    }
-
-    const int index = channel_to_index(channel);
-    if (index < 0 || !states_[index].configured) {
-        return 0;
-    }
-
-    return states_[index].target_us;
+    return states_[index].command_us;
 }
 
 uint16_t ServoPwm::read_output_us(ServoChannel channel) const
@@ -841,11 +916,8 @@ ServoRuntimeState ServoPwm::get_state(ServoChannel channel) const
 
     state.configured = s.configured;
     state.enabled = s.enabled;
-    state.running = false;
-    state.ready = true;
 
-    state.current_us = s.current_us;
-    state.target_us = s.target_us;
+    state.command_us = s.command_us;
     state.output_us = s.output_us;
 
     state.reset_us = s.config.reset_us;
@@ -853,41 +925,7 @@ ServoRuntimeState ServoPwm::get_state(ServoChannel channel) const
     state.max_us = s.config.max_us;
     state.offset_us = s.config.offset_us;
 
-    state.duration_ms = 0;
-    state.total_steps = 0;
-    state.elapsed_steps = 0;
-
-    state.profile = MotionProfile::Immediate;
-
-    state.max_step_us = 0;
-    state.min_effective_step_us = 0;
-
     return state;
-}
-
-bool ServoPwm::is_ready(ServoChannel channel) const
-{
-    const LockGuard guard(this);
-    if (!guard.locked()) {
-        return false;
-    }
-
-    const int index = channel_to_index(channel);
-    if (index < 0 || !states_[index].configured) {
-        return false;
-    }
-
-    return true;
-}
-
-bool ServoPwm::is_all_ready() const
-{
-    const LockGuard guard(this);
-    if (!guard.locked()) {
-        return false;
-    }
-
-    return true;
 }
 
 bool ServoPwm::take_lock(TickType_t timeout_ticks) const

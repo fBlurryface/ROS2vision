@@ -38,48 +38,22 @@ struct ServoPwmConfig {
     int16_t offset_us;
 };
 
-// V5A: MotionProfile 继续放在公共头文件里，供 arm_motion 使用。
-// servo_pwm 本身不再执行轨迹插补。
-enum class MotionProfile : uint8_t {
-    Immediate = 0,
-    Linear,
-    SmoothStep,
-    SmootherStep,
-    DoubleSmootherStep,
-};
-
-// 仅保留为兼容公共类型；V5A 中 servo_pwm 不消费该结构。
-struct ServoMotionOptions {
-    uint32_t duration_ms = 700;
-    MotionProfile profile = MotionProfile::SmootherStep;
-    bool replan_from_current = true;
-    uint16_t max_step_us = 0;
-    uint16_t min_effective_step_us = 0;
-};
-
 struct ServoRuntimeState {
     bool configured;
     bool enabled;
-    bool running;
-    bool ready;
 
-    uint16_t current_us;
-    uint16_t target_us;
+    // Current software command before offset correction. While enabled, it is
+    // updated only after the PWM backend accepts the write. Not servo feedback.
+    uint16_t command_us;
+
+    // Current software output value after offset and range limiting. While
+    // enabled, it is updated only after backend acceptance. Not a measurement.
     uint16_t output_us;
 
     uint16_t reset_us;
     uint16_t min_us;
     uint16_t max_us;
     int16_t offset_us;
-
-    uint32_t duration_ms;
-    uint32_t total_steps;
-    uint32_t elapsed_steps;
-
-    MotionProfile profile;
-
-    uint16_t max_step_us;
-    uint16_t min_effective_step_us;
 };
 
 class ServoPwm {
@@ -92,8 +66,8 @@ public:
     esp_err_t disable_all();
     bool is_enabled(ServoChannel channel) const;
 
-    // V5A: 纯底层接口。只负责单通道立即输出 PWM。
-    // 不保存 duration/running/elapsed_steps，不执行插补。
+    // Immediately update one PWM channel. Trajectory interpolation belongs to
+    // the motion layer.
     esp_err_t write_us_now(ServoChannel channel, uint16_t pulse_us);
 
     esp_err_t set_config(ServoChannel channel, const ServoPwmConfig& config);
@@ -103,13 +77,9 @@ public:
     int16_t get_offset(ServoChannel channel) const;
 
     uint16_t read_command_us(ServoChannel channel) const;
-    uint16_t read_target_us(ServoChannel channel) const;
     uint16_t read_output_us(ServoChannel channel) const;
 
     ServoRuntimeState get_state(ServoChannel channel) const;
-
-    bool is_ready(ServoChannel channel) const;
-    bool is_all_ready() const;
 
 private:
     struct ServoState {
@@ -118,12 +88,10 @@ private:
 
         ServoPwmConfig config = {};
 
-        // current_us / target_us 是软件命令脉宽，不含 offset。
-        // V5A 中二者始终相同；轨迹 target 由 arm_motion 保存。
-        uint16_t current_us = 1500;
-        uint16_t target_us = 1500;
+        // Current command record before offset correction.
+        uint16_t command_us = 1500;
 
-        // output_us 是实际写入 PWM 后端的脉宽，包含 offset 后再限幅。
+        // Current output record after offset and clamping.
         uint16_t output_us = 1500;
     };
 
@@ -144,10 +112,9 @@ private:
     void give_lock() const;
 
     esp_err_t setup_pwm_backend();
-    void teardown_pwm_backend();
-    esp_err_t create_channel_resources(uint8_t index);
-    void destroy_channel_resources(uint8_t index);
-    esp_err_t configure_channel(uint8_t index, uint16_t output_us);
+    esp_err_t teardown_pwm_backend();
+    esp_err_t create_channel_resources(uint8_t index, uint16_t initial_output_us);
+    esp_err_t destroy_channel_resources(uint8_t index);
     esp_err_t write_output_us(uint8_t index, uint16_t output_us);
 
     uint16_t clamp_command_us(uint8_t index, uint16_t pulse_us) const;

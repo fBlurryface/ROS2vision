@@ -84,9 +84,7 @@ const JointCalibration kJointCalibrations[] = {
         100.0f
     },
 
-    // WristRoll:
-    //   当前沿用旧标定。
-    //   +deg 的顺/逆方向后续再实测确认。
+    // WristRoll
     {
         ArmJoint::WristRoll,
         ServoChannel::S1,
@@ -103,8 +101,7 @@ const JointCalibration kJointCalibrations[] = {
     //     +deg = 腕部前倾 / 下压
     //     -deg = 腕部后仰 / 上抬
     //
-    //   当前仍是旧基础标定。
-    //   之前实测接近 +90deg 时容易抖，所以 max_deg 暂收为 +85deg。
+    //   The validated upper limit is +85deg.
     {
         ArmJoint::WristPitch,
         ServoChannel::S2,
@@ -121,7 +118,6 @@ const JointCalibration kJointCalibrations[] = {
     //     +deg = 小臂前倾 / 收肘
     //     -deg = 小臂后伸
     //
-    //   当前仍是旧基础标定。
     {
         ArmJoint::Elbow,
         ServoChannel::S3,
@@ -138,7 +134,6 @@ const JointCalibration kJointCalibrations[] = {
     //     +deg = 大臂前倾
     //     -deg = 大臂后仰
     //
-    //   当前仍是旧基础标定。
     {
         ArmJoint::Shoulder,
         ServoChannel::S4,
@@ -332,7 +327,6 @@ esp_err_t ArmJointController::init(
 
         joints_[joint_index].configured = true;
         joints_[joint_index].calibration = cal;
-        joints_[joint_index].default_options = JointMotionOptions{};
 
         ESP_LOGI(
             TAG,
@@ -617,28 +611,6 @@ float ArmJointController::read_claw_gap_cm() const
     );
 }
 
-float ArmJointController::read_claw_target_gap_cm() const
-{
-    return claw_us_to_gap_cm(
-        read_target_us(ArmJoint::Claw)
-    );
-}
-
-esp_err_t ArmJointController::enable_joint(ArmJoint joint)
-{
-    const int index = joint_to_index(joint);
-    if (!initialized_ || !is_valid_joint_index(index)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const JointCalibration& cal = joints_[index].calibration;
-
-    return servo_->enable(
-        cal.channel,
-        cal.zero_us
-    );
-}
-
 esp_err_t ArmJointController::enable_joint(
     ArmJoint joint,
     float start_deg
@@ -660,6 +632,19 @@ esp_err_t ArmJointController::enable_joint(
     );
 }
 
+esp_err_t ArmJointController::enable_claw_at_gap(float start_gap_cm)
+{
+    const int index = joint_to_index(ArmJoint::Claw);
+    if (!initialized_ || !is_valid_joint_index(index) || servo_ == nullptr ||
+        !std::isfinite(start_gap_cm)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const JointCalibration& cal = joints_[index].calibration;
+    const uint16_t start_us = claw_gap_cm_to_us(start_gap_cm);
+    return servo_->enable(cal.channel, start_us);
+}
+
 esp_err_t ArmJointController::disable_joint(ArmJoint joint)
 {
     const int index = joint_to_index(joint);
@@ -678,6 +663,8 @@ esp_err_t ArmJointController::disable_all()
         return ESP_ERR_INVALID_STATE;
     }
 
+    esp_err_t first_error = ESP_OK;
+
     for (uint8_t i = 0; i < kArmJointCount; ++i) {
         if (!joints_[i].configured) {
             continue;
@@ -687,123 +674,14 @@ esp_err_t ArmJointController::disable_all()
             joints_[i].calibration.channel
         );
 
-        if (ret != ESP_OK) {
-            return ret;
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
         }
     }
 
-    return ESP_OK;
+    return first_error;
 }
 
-
-esp_err_t ArmJointController::move_deg(
-    ArmJoint joint,
-    float target_deg,
-    uint32_t duration_ms
-)
-{
-    (void)duration_ms;
-    return write_deg_now(joint, target_deg);
-}
-
-esp_err_t ArmJointController::move_deg(
-    ArmJoint joint,
-    float target_deg,
-    const JointMotionOptions& options
-)
-{
-    (void)options;
-    return write_deg_now(joint, target_deg);
-}
-
-esp_err_t ArmJointController::move_claw_gap_cm(
-    float target_gap_cm,
-    uint32_t duration_ms
-)
-{
-    (void)duration_ms;
-    return move_claw_gap_cm(target_gap_cm, JointMotionOptions{});
-}
-
-esp_err_t ArmJointController::move_claw_gap_cm(
-    float target_gap_cm,
-    const JointMotionOptions& options
-)
-{
-    (void)options;
-
-    const int index = joint_to_index(ArmJoint::Claw);
-    if (!initialized_ || !is_valid_joint_index(index) || servo_ == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const uint16_t target_us = claw_gap_cm_to_us(target_gap_cm);
-
-    return write_us_now(ArmJoint::Claw, target_us);
-}
-
-esp_err_t ArmJointController::move_group(
-    const ArmJointGroupTarget& target,
-    const ArmJointGroupMotionOptions& options
-)
-{
-    // V5A 中 arm_joint 不再负责多关节同步运动。
-    // 保留该函数仅用于兼容旧调用；它会做一次顺序立即写入。
-    // 真正同步插补由 arm_motion 接管。
-    (void)options;
-
-    if (!initialized_ || servo_ == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    struct PreparedItem {
-        ArmJoint joint;
-        uint16_t pulse_us;
-    };
-
-    PreparedItem items[kArmJointCount] = {
-        {ArmJoint::Base,       deg_to_us(ArmJoint::Base,       target.base_deg)},
-        {ArmJoint::Shoulder,   deg_to_us(ArmJoint::Shoulder,   target.shoulder_deg)},
-        {ArmJoint::Elbow,      deg_to_us(ArmJoint::Elbow,      target.elbow_deg)},
-        {ArmJoint::WristPitch, deg_to_us(ArmJoint::WristPitch, target.wrist_pitch_deg)},
-        {ArmJoint::WristRoll,  deg_to_us(ArmJoint::WristRoll,  target.wrist_roll_deg)},
-        {ArmJoint::Claw,       claw_gap_cm_to_us(target.claw_gap_cm)},
-    };
-
-    for (const PreparedItem& item : items) {
-        const int index = joint_to_index(item.joint);
-        if (!is_valid_joint_index(index)) {
-            return ESP_ERR_INVALID_ARG;
-        }
-
-        if (!servo_->is_enabled(joints_[index].calibration.channel)) {
-            return ESP_ERR_INVALID_STATE;
-        }
-    }
-
-    for (const PreparedItem& item : items) {
-        const esp_err_t ret = write_us_now(item.joint, item.pulse_us);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-    }
-
-    ESP_LOGW(TAG, "move_group used in arm_joint compatibility mode; arm_motion should own synchronized motion");
-
-    return ESP_OK;
-}
-
-esp_err_t ArmJointController::move_speed(
-    ArmJoint joint,
-    float target_deg,
-    float speed_deg_per_s,
-    MotionProfile profile
-)
-{
-    (void)speed_deg_per_s;
-    (void)profile;
-    return write_deg_now(joint, target_deg);
-}
 
 esp_err_t ArmJointController::write_deg_now(
     ArmJoint joint,
@@ -841,72 +719,6 @@ esp_err_t ArmJointController::write_us_now(
     );
 }
 
-esp_err_t ArmJointController::reset_joint(
-    ArmJoint joint,
-    uint32_t duration_ms
-)
-{
-    (void)duration_ms;
-
-    const int index = joint_to_index(joint);
-    if (!initialized_ || !is_valid_joint_index(index)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const JointCalibration& cal = joints_[index].calibration;
-
-    return write_deg_now(
-        joint,
-        cal.zero_deg
-    );
-}
-
-esp_err_t ArmJointController::reset_all(uint32_t duration_ms)
-{
-    (void)duration_ms;
-
-    if (!initialized_) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    for (uint8_t i = 0; i < kArmJointCount; ++i) {
-        if (!joints_[i].configured) {
-            continue;
-        }
-
-        esp_err_t ret = reset_joint(
-            joints_[i].calibration.joint,
-            0
-        );
-
-        if (ret != ESP_OK) {
-            return ret;
-        }
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t ArmJointController::stop(ArmJoint joint)
-{
-    const int index = joint_to_index(joint);
-    if (!initialized_ || !is_valid_joint_index(index)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // V5A 中 arm_joint 没有运动状态机；stop 由 arm_motion 处理。
-    return ESP_OK;
-}
-
-esp_err_t ArmJointController::stop_all()
-{
-    if (!initialized_) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    return ESP_OK;
-}
-
 float ArmJointController::read_command_deg(ArmJoint joint) const
 {
     const int index = joint_to_index(joint);
@@ -925,24 +737,6 @@ float ArmJointController::read_command_deg(ArmJoint joint) const
     );
 }
 
-float ArmJointController::read_target_deg(ArmJoint joint) const
-{
-    const int index = joint_to_index(joint);
-    if (!initialized_ || !is_valid_joint_index(index)) {
-        return 0.0f;
-    }
-
-    const JointCalibration& cal = joints_[index].calibration;
-
-    const uint16_t pulse_us =
-        servo_->read_target_us(cal.channel);
-
-    return us_to_deg_by_index(
-        static_cast<uint8_t>(index),
-        pulse_us
-    );
-}
-
 uint16_t ArmJointController::read_command_us(ArmJoint joint) const
 {
     const int index = joint_to_index(joint);
@@ -951,18 +745,6 @@ uint16_t ArmJointController::read_command_us(ArmJoint joint) const
     }
 
     return servo_->read_command_us(
-        joints_[index].calibration.channel
-    );
-}
-
-uint16_t ArmJointController::read_target_us(ArmJoint joint) const
-{
-    const int index = joint_to_index(joint);
-    if (!initialized_ || !is_valid_joint_index(index)) {
-        return 0;
-    }
-
-    return servo_->read_target_us(
         joints_[index].calibration.channel
     );
 }
@@ -1026,33 +808,6 @@ esp_err_t ArmJointController::set_calibration(
     return ESP_OK;
 }
 
-esp_err_t ArmJointController::set_default_motion_options(
-    ArmJoint joint,
-    const JointMotionOptions& options
-)
-{
-    const int index = joint_to_index(joint);
-    if (!is_valid_joint_index(index)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    joints_[index].default_options = options;
-
-    return ESP_OK;
-}
-
-JointMotionOptions ArmJointController::get_default_motion_options(
-    ArmJoint joint
-) const
-{
-    const int index = joint_to_index(joint);
-    if (!is_valid_joint_index(index)) {
-        return {};
-    }
-
-    return joints_[index].default_options;
-}
-
 JointRuntimeState ArmJointController::get_state(ArmJoint joint) const
 {
     const int index = joint_to_index(joint);
@@ -1071,24 +826,16 @@ JointRuntimeState ArmJointController::get_state(ArmJoint joint) const
                        servo_state.configured;
 
     state.enabled = servo_state.enabled;
-    state.running = false;
-    state.ready = true;
 
     state.joint = joint;
     state.channel = cal.channel;
 
-    state.current_us = servo_state.current_us;
-    state.target_us = servo_state.target_us;
+    state.command_us = servo_state.command_us;
     state.output_us = servo_state.output_us;
 
-    state.current_deg = us_to_deg_by_index(
+    state.command_deg = us_to_deg_by_index(
         static_cast<uint8_t>(index),
-        servo_state.current_us
-    );
-
-    state.target_deg = us_to_deg_by_index(
-        static_cast<uint8_t>(index),
-        servo_state.target_us
+        servo_state.command_us
     );
 
     state.zero_deg = cal.zero_deg;
@@ -1099,34 +846,7 @@ JointRuntimeState ArmJointController::get_state(ArmJoint joint) const
     state.min_deg = cal.min_deg;
     state.max_deg = cal.max_deg;
 
-    state.duration_ms = 0;
-    state.total_steps = 0;
-    state.elapsed_steps = 0;
-
-    state.profile = MotionProfile::Immediate;
-
     return state;
-}
-
-bool ArmJointController::is_ready(ArmJoint joint) const
-{
-    const int index = joint_to_index(joint);
-    if (!initialized_ || !is_valid_joint_index(index)) {
-        return false;
-    }
-
-    return servo_->is_ready(
-        joints_[index].calibration.channel
-    );
-}
-
-bool ArmJointController::is_all_ready() const
-{
-    if (!initialized_) {
-        return false;
-    }
-
-    return servo_->is_all_ready();
 }
 
 }  // namespace learm

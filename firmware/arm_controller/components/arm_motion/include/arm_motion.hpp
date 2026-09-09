@@ -4,111 +4,126 @@
 
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+
 #include "arm_joint.hpp"
 
 namespace learm {
 
-enum class JointMotionStyle : uint8_t {
-    Linear = 0,
-    Smooth,
-    Soft,
+// Rotary-reference generator mode. Claw gap follows its own finite target.
+enum class ArmMotionMode : uint8_t {
+    Hold = 0,
+    Position,
+    Velocity,
+    Stopping,
 };
 
-struct JointSpeedStrategy {
-    // 普通关节：deg/s。
-    // 这是命令轨迹最大速度，不是舵机真实闭环速度。
-    // Speed line is direct linear command speed: no ease-in, no brake curve.
-    float max_speed_deg_per_s;
+// State of the software-controlled PWM output path. The arm has no actuator
+// feedback, so none of these values confirms servo power, motion, or position.
+enum class ArmOutputState : uint8_t {
+    Disabled = 0,
+    Enabled,
+    DriverError,
 };
 
-struct ClawSpeedStrategy {
-    // 夹爪：cm/s。
-    // 使用当前的 gap_cm <-> pulse_us 标定表生成命令轨迹。
-    // Speed line is direct linear claw-gap speed: no ease-in, no brake curve.
-    float max_speed_cm_per_s;
+// Five rotary-joint absolute position references.
+struct ArmMotionJointPosition {
+    float base_deg = 0.0f;
+    float shoulder_deg = 0.0f;
+    float elbow_deg = 0.0f;
+    float wrist_pitch_deg = 0.0f;
+    float wrist_roll_deg = 0.0f;
 };
 
-struct ArmMotionTarget {
-    float base_deg;
-    float shoulder_deg;
-    float elbow_deg;
-    float wrist_pitch_deg;
-    float wrist_roll_deg;
-
-    // 夹爪使用真实控制目标：爪距，单位 cm。
-    float claw_gap_cm;
+// Five rotary-joint reference velocities. These are software reference rates,
+// not measured servo shaft velocities.
+struct ArmMotionJointVelocity {
+    float base_deg_per_s = 0.0f;
+    float shoulder_deg_per_s = 0.0f;
+    float elbow_deg_per_s = 0.0f;
+    float wrist_pitch_deg_per_s = 0.0f;
+    float wrist_roll_deg_per_s = 0.0f;
 };
 
-struct ArmMotionDelta {
-    // First five joints: semantic joint-angle deltas in degrees.
-    float base_deg;
-    float shoulder_deg;
-    float elbow_deg;
-    float wrist_pitch_deg;
-    float wrist_roll_deg;
-
-    // Claw: gap delta in cm. Positive opens the claw, negative closes it.
-    float claw_gap_cm;
+// Basic finite position command used to place the arm before an experiment.
+// It shares the same velocity and acceleration limits as velocity mode.
+struct ArmMotionPositionCommand {
+    ArmMotionJointPosition joint_position = {};
+    float claw_gap_cm = 0.0f;
 };
 
-struct ArmMotionDurationsMs {
-    uint32_t base_ms;
-    uint32_t shoulder_ms;
-    uint32_t elbow_ms;
-    uint32_t wrist_pitch_ms;
-    uint32_t wrist_roll_ms;
-    uint32_t claw_ms;
+// Streaming velocity command used by the visual-servo experiment. The claw
+// keeps the finite target-gap behavior.
+struct ArmMotionCommand {
+    ArmMotionJointVelocity joint_velocity = {};
+    float claw_gap_cm = 0.0f;
 };
 
-// 旧的策略集现在明确归属于 Duration 控制线。
-// 它描述的是 position progress 的曲线形状，而不是速度曲线。
-struct ArmMotionDurationStrategies {
-    JointMotionStyle base;
-    JointMotionStyle shoulder;
-    JointMotionStyle elbow;
-    JointMotionStyle wrist_pitch;
-    JointMotionStyle wrist_roll;
-    JointMotionStyle claw;
+struct ArmMotionJointParameters {
+    float max_velocity_deg_per_s = 30.0f;
+    float max_acceleration_deg_per_s2 = 120.0f;
 };
 
-// 兼容旧代码里的 ArmMotionStrategies 命名。
-using ArmMotionStrategies = ArmMotionDurationStrategies;
+// One fixed parameter group for basic positioning and streaming velocity.
+// There are deliberately no runtime tuning setters in this experiment.
+struct ArmMotionParameters {
+    ArmMotionJointParameters base = {75.0f, 420.0f};
+    ArmMotionJointParameters shoulder = {70.0f, 360.0f};
+    ArmMotionJointParameters elbow = {70.0f, 360.0f};
+    ArmMotionJointParameters wrist_pitch = {85.0f, 450.0f};
+    ArmMotionJointParameters wrist_roll = {60.0f, 300.0f};
 
-// Speed 控制线专属策略集。
-// 普通关节用 deg/s；夹爪用 cm/s。
-// Speed 控制线不做曲线整形；每个 tick 直接按设定速度推进，到目标时钳住。
-struct ArmMotionSpeedStrategies {
-    JointSpeedStrategy base;
-    JointSpeedStrategy shoulder;
-    JointSpeedStrategy elbow;
-    JointSpeedStrategy wrist_pitch;
-    JointSpeedStrategy wrist_roll;
-    ClawSpeedStrategy claw;
+    uint32_t update_period_ms = 20;
+
+    // Applies only to streaming velocity mode.
+    uint32_t command_timeout_ms = 300;
+
+    // Position mode stops when the software reference reaches this tolerance.
+    float position_arrival_epsilon_deg = 0.05f;
+
+    // Legacy claw behavior retained as a target-gap speed line.
+    float claw_max_speed_cm_per_s = 2.5f;
+    float claw_arrival_epsilon_cm = 0.01f;
+};
+
+struct ArmMotionReferenceState {
+    float reference_deg = 0.0f;
+    float target_position_deg = 0.0f;
+    float target_velocity_deg_per_s = 0.0f;
+    float applied_velocity_deg_per_s = 0.0f;
+    bool reference_reached = true;
+    bool limit_blocked = false;
 };
 
 struct ArmMotionState {
-    bool initialized;
-    bool ready;
-    bool moving;
+    bool initialized = false;
+    ArmOutputState output_state = ArmOutputState::Disabled;
+    bool reference_moving = false;
+    ArmMotionMode mode = ArmMotionMode::Hold;
 
-    ArmMotionDurationsMs durations_ms;
-    ArmMotionDurationStrategies duration_strategies;
-    ArmMotionSpeedStrategies speed_strategies;
+    // Last MCPWM/GPIO driver error. A non-OK value does not indicate a servo
+    // fault; it only describes the software output path.
+    esp_err_t last_driver_error = ESP_OK;
+    bool driver_error_joint_valid = false;
+    ArmJoint driver_error_joint = ArmJoint::Base;
 
-    // 兼容旧字段名。它等同于 duration_strategies。
-    ArmMotionDurationStrategies strategies;
+    bool command_fresh = false;
+    bool command_timed_out = false;
+    uint32_t command_age_ms = 0;
 
-    JointRuntimeState base;
-    JointRuntimeState shoulder;
-    JointRuntimeState elbow;
-    JointRuntimeState wrist_pitch;
-    JointRuntimeState wrist_roll;
-    JointRuntimeState claw;
+    ArmMotionReferenceState base = {};
+    ArmMotionReferenceState shoulder = {};
+    ArmMotionReferenceState elbow = {};
+    ArmMotionReferenceState wrist_pitch = {};
+    ArmMotionReferenceState wrist_roll = {};
 
-    float claw_gap_cm;
-    float claw_target_gap_cm;
+    float claw_reference_gap_cm = 0.0f;
+    float claw_target_gap_cm = 0.0f;
+
+    ArmMotionPositionCommand latest_position_command = {};
+    ArmMotionCommand latest_velocity_command = {};
+    ArmMotionParameters parameters = {};
 };
 
 class ArmMotion {
@@ -117,174 +132,47 @@ public:
 
     bool is_initialized() const;
 
-    esp_err_t enable_all();
+    // Enable all rotary joints at their calibration zero and close the claw.
+    esp_err_t enable_all_at_zero_closed();
+
+    // Enable all actuators using one explicit initial command. The resulting
+    // PWM commands become the initial software references.
+    esp_err_t enable_all_at(const ArmMotionPositionCommand& initial_pose);
+
     esp_err_t disable_all();
 
-    esp_err_t set_durations_ms(
-        uint32_t base_ms,
-        uint32_t shoulder_ms,
-        uint32_t elbow_ms,
-        uint32_t wrist_pitch_ms,
-        uint32_t wrist_roll_ms,
-        uint32_t claw_ms
-    );
+    // Basic absolute-position mode for setup and pose adjustment. The command
+    // automatically completes and then transitions to Hold.
+    esp_err_t move_to(const ArmMotionPositionCommand& command);
 
-    // Duration 控制线的策略配置。
-    esp_err_t set_duration_strategies(
-        JointMotionStyle base,
-        JointMotionStyle shoulder,
-        JointMotionStyle elbow,
-        JointMotionStyle wrist_pitch,
-        JointMotionStyle wrist_roll,
-        JointMotionStyle claw
-    );
+    // Streaming velocity mode. The velocity remains active until replaced,
+    // stop() is called, a joint limit blocks it, timeout occurs, or positioning
+    // mode explicitly takes control.
+    esp_err_t command(const ArmMotionCommand& command);
 
-    // 兼容旧接口名：等同于 set_duration_strategies。
-    esp_err_t set_strategies(
-        JointMotionStyle base,
-        JointMotionStyle shoulder,
-        JointMotionStyle elbow,
-        JointMotionStyle wrist_pitch,
-        JointMotionStyle wrist_roll,
-        JointMotionStyle claw
-    );
-
-    // Speed 控制线的策略配置。
-    esp_err_t set_speed_strategies(
-        const JointSpeedStrategy& base,
-        const JointSpeedStrategy& shoulder,
-        const JointSpeedStrategy& elbow,
-        const JointSpeedStrategy& wrist_pitch,
-        const JointSpeedStrategy& wrist_roll,
-        const ClawSpeedStrategy& claw
-    );
-
-    // 便捷接口：只改最大速度。
-    esp_err_t set_speed_limits(
-        float base_deg_per_s,
-        float shoulder_deg_per_s,
-        float elbow_deg_per_s,
-        float wrist_pitch_deg_per_s,
-        float wrist_roll_deg_per_s,
-        float claw_cm_per_s
-    );
-
-
-    ArmMotionDurationsMs get_durations_ms() const;
-    ArmMotionDurationStrategies get_duration_strategies() const;
-    ArmMotionStrategies get_strategies() const;
-    ArmMotionSpeedStrategies get_speed_strategies() const;
-
-    // Duration 控制线：按总时长和 duration_strategies 运动。
-    esp_err_t move_to(
-        float base_deg,
-        float shoulder_deg,
-        float elbow_deg,
-        float wrist_pitch_deg,
-        float wrist_roll_deg,
-        float claw_gap_cm
-    );
-
-    esp_err_t move_to(const ArmMotionTarget& target);
-
-    // Speed 控制线：按 speed_strategies 的最大速度直线匀速运动，动作耗时由距离自然决定。
-    esp_err_t move_to_speed(
-        float base_deg,
-        float shoulder_deg,
-        float elbow_deg,
-        float wrist_pitch_deg,
-        float wrist_roll_deg,
-        float claw_gap_cm
-    );
-
-    esp_err_t move_to_speed(const ArmMotionTarget& target);
-
-    // Immediate control line: write all joints to the target pose now.
-    // No interpolation, duration, or speed limiting is applied by arm_motion.
-    // This is intended for high-level controllers that own timing externally
-    // (for example, incremental Jacobian / resolved-rate control loops).
-    esp_err_t move_to_immediate(
-        float base_deg,
-        float shoulder_deg,
-        float elbow_deg,
-        float wrist_pitch_deg,
-        float wrist_roll_deg,
-        float claw_gap_cm
-    );
-
-    esp_err_t move_to_immediate(const ArmMotionTarget& target);
-
-    // Incremental immediate control line: add deltas to the current software
-    // commanded pose, then write the resulting absolute pose immediately.
-    // First five deltas are degrees; claw delta is gap cm.
-    // This is intended for controllers that output delta-q, such as an
-    // incremental Jacobian controller.
-    esp_err_t move_delta_immediate(
-        float base_delta_deg,
-        float shoulder_delta_deg,
-        float elbow_delta_deg,
-        float wrist_pitch_delta_deg,
-        float wrist_roll_delta_deg,
-        float claw_gap_delta_cm
-    );
-
-    esp_err_t move_delta_immediate(const ArmMotionDelta& delta);
-
-    esp_err_t stop_all();
-
-    bool is_ready() const;
-    bool is_moving() const;
+    // Enter Stopping, ramp rotary reference velocity to zero, then enter Hold.
+    esp_err_t stop();
 
     ArmMotionState get_state() const;
+    ArmMotionParameters get_parameters() const;
 
 private:
-    struct MotionJointState {
+    struct JointStreamState {
+        ArmJoint joint = ArmJoint::Base;
+        float reference_deg = 0.0f;
+        float target_position_deg = 0.0f;
+        float target_velocity_deg_per_s = 0.0f;
+        float applied_velocity_deg_per_s = 0.0f;
         bool configured = false;
         bool enabled = false;
-        bool running = false;
-
-        ArmJoint joint = ArmJoint::Claw;
-        ServoChannel channel = ServoChannel::S0;
-
-        JointTimingMode timing_mode = JointTimingMode::Duration;
-
-        uint16_t start_us = 1500;
-        uint16_t current_us = 1500;
-        uint16_t target_us = 1500;
-        uint16_t output_us = 1500;
-
-        // 浮点累计值避免速度模式下 6.67us/tick 这类小数步长反复丢精度。
-        float start_us_f = 1500.0f;
-        float current_us_f = 1500.0f;
-        float target_us_f = 1500.0f;
-
-        // Duration strategy state.
-        uint32_t duration_ms = 0;
-        uint32_t total_steps = 0;      // Debug/compatibility only: nominal 20ms step count.
-        uint32_t elapsed_steps = 0;    // Debug counter; duration progress uses elapsed_time_ms.
-        float elapsed_time_ms = 0.0f;
-
-        MotionProfile profile = MotionProfile::SmootherStep;
-        uint16_t max_step_us = 0;
-        uint16_t min_effective_step_us = 0;
-
-        // Speed strategy state.
-        // 普通关节单位是 deg / deg/s / deg/s^2。
-        // 夹爪单位是 cm / cm/s / cm/s^2。
-        float current_position = 0.0f;
-        float target_position = 0.0f;
-        float current_speed_units_per_s = 0.0f;
-        float max_speed_units_per_s = 0.0f;
-        float accel_units_per_s2 = 0.0f;
-        float decel_units_per_s2 = 0.0f;
+        bool reference_reached = true;
+        bool limit_blocked = false;
     };
 
-private:
     class LockGuard {
     public:
         explicit LockGuard(const ArmMotion* owner, TickType_t timeout_ticks = portMAX_DELAY);
         ~LockGuard();
-
         bool locked() const;
 
     private:
@@ -292,96 +180,66 @@ private:
         bool locked_ = false;
     };
 
-    static JointMotionOptions make_duration_options(
-        uint32_t duration_ms,
-        JointMotionStyle style
-    );
-
-    // 兼容旧私有函数名。
-    static JointMotionOptions make_options(
-        uint32_t duration_ms,
-        JointMotionStyle style
-    );
-
-    static JointMotionOptions make_speed_options(
-        float max_speed_units_per_s
-    );
-
-    static JointMotionOptions make_immediate_options();
-
-    static MotionProfile style_to_profile(JointMotionStyle style);
-
-    static float evaluate_profile(MotionProfile profile, float t);
-    static float smoothstep(float t);
-    static float smootherstep(float t);
-
-    static int joint_to_index(ArmJoint joint);
-    static uint32_t clamp_duration_ms(uint32_t duration_ms);
-    static bool is_valid_joint_speed_strategy(const JointSpeedStrategy& strategy);
-    static bool is_valid_claw_speed_strategy(const ClawSpeedStrategy& strategy);
-
-    bool take_lock(TickType_t timeout_ticks = portMAX_DELAY) const;
-    void give_lock() const;
-
     static void task_entry(void* arg);
     void task_loop();
+    void update_locked(float dt_s);
 
-    void update_all_locked(float dt_s);
-    esp_err_t update_one_locked(uint8_t index, float dt_s);
-    esp_err_t update_duration_locked(MotionJointState& s, float dt_s);
-    esp_err_t update_speed_locked(MotionJointState& s, float dt_s);
+    static bool finite_position(const ArmMotionJointPosition& position);
+    static bool finite_velocity(const ArmMotionJointVelocity& velocity);
+    static float approach(float current, float target, float max_change);
+    static int stream_index(ArmJoint joint);
 
-    esp_err_t sync_state_from_hardware_locked(ArmJoint joint);
+    JointStreamState* stream_for_joint_locked(ArmJoint joint);
+    const JointStreamState* stream_for_joint_locked(ArmJoint joint) const;
+    const ArmMotionJointParameters& parameters_for_joint(ArmJoint joint) const;
 
-    esp_err_t commit_joint_target_locked(
-        ArmJoint joint,
-        uint16_t target_us,
-        const JointMotionOptions& options
+    esp_err_t sync_streams_from_joint_layer_locked();
+    esp_err_t enable_all_at_locked(
+        const ArmMotionPositionCommand& initial_pose
     );
-
-    float motion_position_from_us_locked(ArmJoint joint, uint16_t pulse_us) const;
-    uint16_t motion_us_from_position_locked(ArmJoint joint, float position) const;
-
-    void clear_motion_progress_locked(MotionJointState& s);
-
-    JointRuntimeState make_runtime_state_locked(ArmJoint joint) const;
+    esp_err_t write_stream_joint_locked(
+        JointStreamState& state,
+        float dt_s,
+        bool clamp_to_position_target
+    );
+    void prepare_position_velocity_locked(JointStreamState& state);
+    void set_position_target_locked(const ArmMotionJointPosition& position);
+    void set_target_velocity_locked(const ArmMotionJointVelocity& velocity);
+    void clear_velocity_locked();
+    void start_stopping_locked();
+    void enter_hold_locked();
+    void record_driver_error_locked(
+        esp_err_t error,
+        ArmJoint joint,
+        bool joint_valid
+    );
+    void clear_driver_error_locked();
 
 private:
     bool initialized_ = false;
+    ArmOutputState output_state_ = ArmOutputState::Disabled;
+    ArmMotionMode mode_ = ArmMotionMode::Hold;
+    esp_err_t last_driver_error_ = ESP_OK;
+    bool driver_error_joint_valid_ = false;
+    ArmJoint driver_error_joint_ = ArmJoint::Base;
     ArmJointController* joints_ = nullptr;
 
+    ArmMotionParameters parameters_ = {};
+    ArmMotionPositionCommand latest_position_command_ = {};
+    ArmMotionCommand latest_velocity_command_ = {};
+
+    JointStreamState streams_[5] = {};
+
+    float claw_reference_gap_cm_ = 0.0f;
+    float claw_target_gap_cm_ = 0.0f;
+
+    int64_t last_command_us_ = 0;
+    bool command_received_ = false;
+    bool command_timed_out_ = false;
+
+    mutable SemaphoreHandle_t mutex_ = nullptr;
     TaskHandle_t task_handle_ = nullptr;
     volatile bool task_stop_requested_ = false;
-    SemaphoreHandle_t lock_ = nullptr;
-
-    MotionJointState states_[kArmJointCount] = {};
-
-    ArmMotionDurationsMs durations_ms_ = {
-        700,
-        700,
-        700,
-        700,
-        700,
-        700,
-    };
-
-    ArmMotionDurationStrategies duration_strategies_ = {
-        JointMotionStyle::Soft,
-        JointMotionStyle::Soft,
-        JointMotionStyle::Soft,
-        JointMotionStyle::Soft,
-        JointMotionStyle::Soft,
-        JointMotionStyle::Soft,
-    };
-
-    ArmMotionSpeedStrategies speed_strategies_ = {
-        {45.0f},  // base deg/s
-        {35.0f},  // shoulder deg/s
-        {35.0f},  // elbow deg/s
-        {50.0f},  // wrist_pitch deg/s
-        {70.0f},  // wrist_roll deg/s
-        {2.5f},   // claw cm/s
-    };
 };
 
 }  // namespace learm
