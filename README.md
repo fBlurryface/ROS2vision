@@ -1,105 +1,89 @@
-# ROS2vision
+<h1 align="center">ROS2vision</h1>
 
-ROS 2 Jazzy visual closed-loop project with an industrial PC camera pipeline and Arduino UNO actuator control.
+<p align="center">
+  Machine vision and robotic actuation, with Linux and ROS 2 as the host platform.
+</p>
 
-## Repository structure
+<p align="center">
+  <a href="ros2_ws/"><img src="https://img.shields.io/badge/ROS_2-Jazzy-22314E?style=flat" alt="ROS 2 Jazzy"></a>
+  <a href="firmware/arm_controller/"><img src="https://img.shields.io/badge/ESP32-ESP--IDF-C62828?style=flat" alt="ESP32 with ESP-IDF"></a>
+  <a href="firmware/uno_controller/"><img src="https://img.shields.io/badge/Arduino-UNO-00878F?style=flat" alt="Arduino UNO"></a>
+</p>
 
-- `.github/workflows/`
-  - CI workflows for ROS 2 workspace and Arduino firmware
-- `docs/`
-  - System architecture, hardware notes, protocol notes, software notes, deployment notes
-- `firmware/uno_controller/`
-  - Arduino UNO firmware for actuator-side control
-- `ros2_ws/src/camera_vision_pkg/`
-  - Camera acquisition package
-- `ros2_ws/src/control_pkg/`
-  - Motion/control-side ROS 2 package scaffold
-- `ros2_ws/src/recognition_pkg/`
-  - Vision recognition package with preprocessing and target detection nodes
-- `ros2_ws/src/ros2vision_interfaces/`
-  - Custom ROS 2 interfaces for structured target output
+<p align="center">
+  <a href="#architecture">Architecture</a> ·
+  <a href="#getting-started">Getting Started</a> ·
+  <a href="#roadmap">Roadmap</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
 
-## Current project status
+## Overview
 
-The repository has completed its initial engineering scaffold and now has its first usable recognition-side detection path:
+ROS2vision develops a visual feedback system that connects camera perception to physical motion. Linux and ROS 2 provide the host-side foundation; embedded controllers handle actuator output.
 
-- ROS 2 workspace skeleton is in place
-- GitHub Actions CI exists for ROS 2 Jazzy workspace
-- GitHub Actions CI exists for Arduino firmware compilation
-- UNO controller firmware has an initial implementation
-- `camera_vision_pkg` is now a real ROS 2 package and has become the first package with a validated bringup path
-- `recognition_pkg` now has two validated nodes:
-  - `image_preprocessor_node`
-  - `target_detector_node`
-- `ros2vision_interfaces` now provides the first custom target message used by the recognition layer:
-  - `Target.msg`
+The repository currently contains a ROS 2 vision-to-UNO path and a separate ESP32 arm controller. Bringing the arm into the ROS 2 pipeline is the next integration step.
 
-## Camera subsystem status
+| Area | Current implementation |
+| --- | --- |
+| ROS 2 perception | USB camera acquisition, image preprocessing, face/color detection, and a structured target message |
+| UNO control | Horizontal target following over USB serial, with a ROS 2 bridge and stepper firmware |
+| ESP32 arm control | USB serial commands, five rotary joints plus a claw, position and streaming-velocity control, and resolved-rate kinematics |
+| ROS 2 arm integration | Planned: hand-target perception, visual-error processing, and ESP32 integration with ROS 2 |
 
-The first usable version of the camera acquisition path is now available.
+Implementation and hardware validation are tracked separately in [Project Progress](docs/progress.md).
 
-Current characteristics:
+## Architecture
 
-- Package: `ros2_ws/src/camera_vision_pkg`
-- Output role: raw image source only
-- Image processing such as grayscale conversion, undistortion, rectification, and recognition pre-processing is intentionally left to downstream nodes
-- Supported startup modes:
-  - `vga`
-  - `wide`
-  - `hd`
-- Device path strategy:
-  - do not rely on drifting `/dev/videoN`
-  - use persistent alias `/dev/ros2vision_camera`
-- Recovery behavior:
-  - same-port USB disconnect/reconnect has been validated
-  - reconnect through a different physical USB port is not yet guaranteed
-- Observed runtime:
-  - all three validated startup modes are currently around ~16.6 Hz in practical testing
+```mermaid
+flowchart TD
+    camera["USB camera"] --> vision["ROS 2 perception"]
+    vision -->|"Target"| uno_host["UNO follower and serial bridge"]
+    uno_host -->|"USB serial: ANG / STEP"| uno["UNO stepper controller"]
+    vision -.->|"Planned"| arm_host["ROS 2 arm control"]
+    arm_host -.->|"Planned: control input"| arm["ESP32 arm controller"]
+    arm --> actuators["Five rotary joints and claw"]
+```
 
-## Recognition subsystem status
+Solid arrows show implemented connections; dashed arrows show planned ROS 2 arm integration. The ESP32 firmware already accepts commands over USB serial. Its future ROS 2 integration method is still open; [communication options](docs/architecture.md#host-to-mcu-communication) distinguish the current path from candidate extensions.
 
-The recognition package has now moved beyond pure preprocessing and has reached its first structured target-output milestone.
+| Directory | Responsibility |
+| --- | --- |
+| [ros2_ws/](ros2_ws/) | ROS 2 packages for acquisition, recognition, control, interfaces, and system launch |
+| [firmware/](firmware/) | Arduino UNO and ESP32 actuator controllers |
+| [docs/](docs/) | Architecture, bringup, hardware, interfaces, and project progress |
 
-Current characteristics:
+See [Architecture](docs/architecture.md) for module boundaries and control behavior.
 
-- Package: `ros2_ws/src/recognition_pkg`
-- Current node chain:
-  - `image_preprocessor_node`
-  - `target_detector_node`
-- Supported current modes:
-  - `face`
-  - `color`
-- Current recognition outputs:
-  - `/recognition/preprocessed/image`
-  - `/recognition/preprocessed/debug_image`
-  - `/recognition/preprocessed/mask`
-  - `/recognition/detection/debug_image`
-  - `/recognition/target`
-- Current practical status:
-  - `face` mode is currently the more stable validated path
-  - `color` mode works, but still requires threshold and robustness tuning
+## Getting Started
 
-See detailed notes here:
+| Path | Start here |
+| --- | --- |
+| ROS 2 camera and recognition, then optional UNO following | [ROS 2 bringup](docs/bringup.md#ros-2-host) |
+| Standalone ESP32 arm firmware | [ESP32 arm bringup](docs/bringup.md#esp32-arm-controller) |
 
-- `docs/software/camera.md`
-- `docs/software/recognition.md`
-- `docs/deployment/industrial_pc_setup.md`
-- `ros2_ws/src/camera_vision_pkg/README.md`
-- `ros2_ws/src/recognition_pkg/README.md`
-- `ros2_ws/src/ros2vision_interfaces/README.md`
+After completing the ROS 2 build and device setup, start the vision pipeline:
 
-## Recommended reading order
+```bash
+ros2 launch ros2vision_bringup full_system.launch.py enable_control:=false
+```
 
-If you are new to the project:
+This starts the camera, preprocessor, and face detector. The [bringup guide](docs/bringup.md) covers adding UNO control, selecting color mode, and opening the debug viewer.
 
-1. Read `docs/architecture.md`
-2. Read `docs/software/camera.md`
-3. Read `docs/software/recognition.md`
-4. Read `docs/deployment/industrial_pc_setup.md`
-5. Read package-level README files as needed
+## Roadmap
 
-## Development note
+- Extend recognition with hand-target perception and configurable target selection.
+- Add normalized visual-error processing and integrate the ESP32 arm with ROS 2.
+- Evaluate Wi-Fi and Bluetooth communication options and micro-ROS integration.
+- Integrate launch configuration, diagnostics, and end-to-end arm validation.
 
-At the current stage, the camera package is still the most mature source-layer package in the repository.
+The implementation scope and open decisions are maintained in [Project Progress](docs/progress.md#next-milestone-ros-2-arm-integration).
 
-Recognition has now moved beyond scaffold status and has reached its first structured target-output stage, while `control_pkg` remains the next major implementation target for completing the end-to-end closed-loop path.
+## Documentation
+
+| I want to… | Read |
+| --- | --- |
+| Understand the system and its responsibilities | [Architecture](docs/architecture.md) |
+| Build, flash, and run the existing paths | [Bringup](docs/bringup.md) |
+| Check wiring, geometry, and calibration | [Hardware](docs/hardware.md) |
+| Look up messages, commands, units, and state semantics | [Interfaces](docs/interfaces.md) |
+| Review milestones, validation, and planned work | [Project Progress](docs/progress.md) |
